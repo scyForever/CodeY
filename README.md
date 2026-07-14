@@ -109,7 +109,7 @@ Always Read:
 
 ### 双层路由
 
-1. **Skill 路由**：根据每个 Skill 的 `name`、`description` 与 `triggers` 选出领域 Skill。显式 `/skill-name` 优先。
+1. **Skill 路由**：根据每个 Skill 的 `name` 与 `triggers` 选出领域 Skill。`description` 用于导航与展示，当前不参与确定性匹配；显式 `/skill-name` 优先。
 2. **Task 路由**：只在已选 Skill 内按任务 label/trigger 匹配；无匹配时使用唯一的 `other`。
 
 一个 `ask()` 运行期间会固定路由，避免模型重试或工具循环中途切换工作流；同一 session 的下一条用户请求会重新路由。
@@ -311,11 +311,46 @@ codey --approval never # 拒绝危险操作
 
 - `CodeY/evaluation/evaluator.py`：固定 benchmark、fixture、verifier、预算和停止原因检查。
 - `CodeY/evaluation/metrics.py`：记忆/上下文/安全/恢复实验与报告渲染。
+- `CodeY/evaluation/real_skill_routing.py`：真实外部模型的多 Skill 选择、解析和计分。
+- `scripts/run_real_skill_routing_experiment.py`：运行 5/15/25/50/100 Skill 对照实验。
 - `scripts/run_provider_experiments.py`：provider 实验。
 - `scripts/collect_resume_metrics.py`：聚合 benchmark 与 run artifacts。
 - `scripts/run_large_scale_experiments.py`：生成完整实验产物。
 
-脚本需要相应 benchmark、fixture、run root 和输出路径。README 不写入无法由仓库工件复现的百分比；简历指标应从生成的 JSON/Markdown 结果中提取。
+### 真实模型多 Skill 命中率
+
+真实评测数据位于 `benchmarks/real-skill-routing/`：
+
+- `skills.json`：100 个真实软件工程 Skill，覆盖架构、前后端、数据、测试、交付、运维、安全和专项平台。
+- `requests.json`：100 条单 Skill 请求、10 条多 Skill 请求和 5 条拒识请求，包含中文、英文和混合技术表达。
+- `description-rules.md`：领域互斥 Description 的七项编写指南、标准模板与自动校验边界。
+- 前 5 条单 Skill 请求固定为 anchor，在所有规模重复使用，用来观察新增干扰 Skill 导致的退化。
+
+实验固定覆盖 5、15、25、50、100 个 Skill，并使用 `.env` 中 `CODEY_PROVIDER` 对应的真实外部模型。每个规模运行两种条件：
+
+- **flat_full**：向模型一次性提供所有完整 Skill 定义和通用工作说明。
+- **structured_index**：按领域组织同一批 Skill 的紧凑索引，只保留选择阶段需要的职责信息。
+
+```bash
+# 使用 .env 中的 provider/model 执行完整对照实验
+python scripts/run_real_skill_routing_experiment.py
+
+# 先验证最小规模，或显式覆盖 provider
+python scripts/run_real_skill_routing_experiment.py --scales 5
+python scripts/run_real_skill_routing_experiment.py --provider anthropic
+```
+
+脚本默认启用断点续跑，并把大规模请求按最多 25 条一批提交；可以使用 `--no-resume`、`--batch-size`、`--timeout` 和 `--delay-seconds` 调整运行策略。
+
+结果写入：
+
+- `artifacts/real-skill-routing/results.json`：原始模型响应、逐请求预测、usage、延迟和完整计分。
+- `artifacts/real-skill-routing/results.md`：按规模与模式汇总的可读报告。
+- `artifacts/real-skill-routing/skills/*/SKILL.md`：由固定目录物化出的 100 个可解析 Skill 文件。
+
+核心指标包括 exact set match、固定 anchor accuracy、单 Skill accuracy、多 Skill exact match、拒识 accuracy、micro precision/recall/F1、误触发数、漏召回数、prompt 字符数和调用延迟。外部模型调用不进入默认 pytest；测试只使用固定 JSON 验证数据、提示词、解析器和计分逻辑。
+
+其他实验脚本仍需要相应 benchmark、fixture、run root 和输出路径。
 
 ## 开发与验证
 
@@ -327,15 +362,3 @@ python -m CodeY --help
 ```
 
 测试使用临时 workspace 与 `FakeModelClient`，覆盖双层路由、渐进加载、非法路径、SessionStart 生命周期、XML 边界、上下文预算、同 session 重路由和包入口。
-
-## 已知限制
-
-- Skill 二级匹配是确定性的 trigger/phrase 匹配，不是语义分类模型。
-- 多 Skill 且请求无法明确选中时会报歧义，不会按文件系统顺序猜测。
-- 当前没有远程 Skill registry，也不会从 Skill 自动执行 shell hook。
-- Provider adapter 的能力取决于兼容服务，不保证与官方 API 全功能一致。
-- 实验默认需要仓库外补齐 benchmark fixture/产物路径。
-
-## 设计参考
-
-结构化 Skill 的双层路由、Always-read/按需加载、XML 边界和 SessionStart 恢复思路参考并针对 CodeY Runtime 重构自 `D:\研一\skill-based-architecture`。本仓库只采用与本地 Agent Runtime 直接相关的机制，没有复制其 meta-skill 维护流程、模板同步系统或 Claude Code/Cursor 配置。

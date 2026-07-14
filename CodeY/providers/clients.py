@@ -12,6 +12,21 @@ import urllib.error
 import urllib.request
 
 OPENAI_COMPATIBLE_USER_AGENT = "codey/0.1"
+RETRYABLE_HTTP_CODES = {408, 409, 425, 429, 500, 502, 503, 504, 524}
+
+
+def _http_retry_delay(exc, attempt):
+    retry_after = (getattr(exc, "headers", None) or {}).get("Retry-After")
+    if retry_after:
+        try:
+            return min(120.0, max(1.0, float(retry_after)))
+        except (TypeError, ValueError):
+            pass
+    if exc.code == 429:
+        return min(60.0, 10.0 * (2**attempt))
+    if exc.code == 524:
+        return 120.0
+    return 0.5 * (attempt + 1)
 
 
 class FakeModelClient:
@@ -224,12 +239,13 @@ def _extract_usage_cache_details(data):
 
 
 class OpenAICompatibleModelClient:
-    def __init__(self, model, base_url, api_key, temperature, timeout):
+    def __init__(self, model, base_url, api_key, temperature, timeout, attempts=3):
         self.model = model
         self.base_url = _normalize_versioned_base_url(base_url)
         self.api_key = api_key
         self.temperature = temperature
         self.timeout = timeout
+        self.attempts = max(1, int(attempts))
         # 当前只在明确支持 prompt cache 语义的后端上启用这条链路，
         # 避免对不支持的后端传一个“看起来统一、其实没意义”的伪参数。
         self.supports_prompt_cache = any(host in self.base_url for host in ("openai.com", "right.codes"))
@@ -292,7 +308,7 @@ class OpenAICompatibleModelClient:
             headers=headers,
             method="POST",
         )
-        attempts = 3
+        attempts = self.attempts
         for attempt in range(attempts):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -302,11 +318,11 @@ class OpenAICompatibleModelClient:
                 break
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
-                if exc.code >= 500 and attempt < attempts - 1:
-                    time.sleep(0.5 * (attempt + 1))
+                if exc.code in RETRYABLE_HTTP_CODES and attempt < attempts - 1:
+                    time.sleep(_http_retry_delay(exc, attempt))
                     continue
                 raise RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}") from exc
-            except (urllib.error.URLError, RemoteDisconnected) as exc:
+            except (urllib.error.URLError, RemoteDisconnected, TimeoutError) as exc:
                 if attempt < attempts - 1:
                     time.sleep(0.5 * (attempt + 1))
                     continue
@@ -345,6 +361,7 @@ class OpenAICompatibleModelClient:
             "prompt_cache_supported": self.supports_prompt_cache,
             "prompt_cache_key": prompt_cache_key,
             "prompt_cache_retention": prompt_cache_retention,
+            "request_attempts": attempt + 1,
             **_extract_usage_cache_details(data),
         }
         return _extract_openai_text(data)
@@ -359,13 +376,32 @@ def _extract_anthropic_text(data):
     return ""
 
 
+def _extract_anthropic_usage(data):
+    usage = data.get("usage") or {}
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    total_tokens = None
+    if input_tokens is not None or output_tokens is not None:
+        total_tokens = int(input_tokens or 0) + int(output_tokens or 0)
+    cached_tokens = int(usage.get("cache_read_input_tokens") or 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "cached_tokens": cached_tokens,
+        "cache_creation_tokens": int(usage.get("cache_creation_input_tokens") or 0),
+        "cache_hit": cached_tokens > 0,
+    }
+
+
 class AnthropicCompatibleModelClient:
-    def __init__(self, model, base_url, api_key, temperature, timeout):
+    def __init__(self, model, base_url, api_key, temperature, timeout, attempts=3):
         self.model = model
         self.base_url = _normalize_versioned_base_url(base_url)
         self.api_key = api_key
         self.temperature = temperature
         self.timeout = timeout
+        self.attempts = max(1, int(attempts))
         self.supports_prompt_cache = False
         self.last_completion_metadata = {}
 
@@ -395,6 +431,8 @@ class AnthropicCompatibleModelClient:
 
         headers = {
             "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": OPENAI_COMPATIBLE_USER_AGENT,
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
         }
@@ -405,7 +443,7 @@ class AnthropicCompatibleModelClient:
             headers=headers,
             method="POST",
         )
-        attempts = 3
+        attempts = self.attempts
         for attempt in range(attempts):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -413,11 +451,11 @@ class AnthropicCompatibleModelClient:
                 break
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
-                if exc.code >= 500 and attempt < attempts - 1:
-                    time.sleep(0.5 * (attempt + 1))
+                if exc.code in RETRYABLE_HTTP_CODES and attempt < attempts - 1:
+                    time.sleep(_http_retry_delay(exc, attempt))
                     continue
                 raise RuntimeError(f"Anthropic-compatible request failed with HTTP {exc.code}: {body}") from exc
-            except (urllib.error.URLError, RemoteDisconnected) as exc:
+            except (urllib.error.URLError, RemoteDisconnected, TimeoutError) as exc:
                 if attempt < attempts - 1:
                     time.sleep(0.5 * (attempt + 1))
                     continue
@@ -435,6 +473,10 @@ class AnthropicCompatibleModelClient:
             ) from exc
         if data.get("error"):
             raise RuntimeError(f"Anthropic-compatible error: {data['error']}")
+        self.last_completion_metadata = {
+            "request_attempts": attempt + 1,
+            **_extract_anthropic_usage(data),
+        }
         text = _extract_anthropic_text(data)
         if text:
             return text
