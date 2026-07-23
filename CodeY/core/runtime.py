@@ -75,6 +75,8 @@ class CodeYAgent:
         skill_mode="auto",
         hook_callbacks=None,
         evolution_thresholds=None,
+        evolution_llm_config=None,
+        evolution_llm_client=None,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -98,7 +100,12 @@ class CodeYAgent:
         self.current_route = RouteMatch()
         self._compact_hook_run_id = ""
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".codey" / "runs")
-        self.cognitive_loop = CognitiveLoop(self.root, thresholds=evolution_thresholds)
+        self.cognitive_loop = CognitiveLoop(
+            self.root,
+            thresholds=evolution_thresholds,
+            llm_client=evolution_llm_client if evolution_llm_client is not None else model_client,
+            llm_config=evolution_llm_config,
+        )
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
@@ -331,6 +338,7 @@ class CodeYAgent:
                     "root_cause": self.last_cognitive_loop.get("root_cause"),
                     "generated_patches": self.last_cognitive_loop.get("generated_patches", []),
                     "patch_transitions": self.last_cognitive_loop.get("patch_transitions", []),
+                    "decision_audit": self.last_cognitive_loop.get("decision_audit", {}),
                 },
             )
         except Exception as exc:

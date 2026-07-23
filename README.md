@@ -14,7 +14,7 @@ CodeY 是一个面向本地代码仓库的小型 Coding Agent Runtime。它将�
 - **分段上下文预算**：稳定 prefix、route context、memory、相关记忆、历史和当前请求分别管理；当前请求不会被裁剪。
 - **工具安全边界**：工作区路径约束、参数校验、重复调用防护、危险操作审批、只读子 Agent 和 secret redaction。
 - **可恢复与可审计**：会话、检查点、工作记忆、trace、task state 和 report 持久化到 `.codey/`。
-- **规则监督的认知闭环**：任务结束后基于结构化 trace 完成自省、结果归一化、根因归类、Patch 灰度和知识路由；不会从模型自由文本中猜测性学习。
+- **规则监督的认知闭环**：任务结束后基于结构化 trace 完成自省、结果归一化、根因归类、Patch 灰度和知识路由；可选的受限 LLM Advisor 只能消歧和精炼规则候选，不会从模型自由文本中猜测性学习。
 - **评测工具**：包含固定任务评测、上下文/记忆/恢复/安全实验与 provider 实验脚本。
 
 ## 架构
@@ -320,6 +320,38 @@ Trace Collector
 ```
 
 自省结果固定回答三个问题，并写入 `report.json` 的 `cognitive_loop.reflection`：本次是否观察到新知识、是否出现错误路线、是否确认有过时知识。没有结构化证据时返回 `no` 或 `not_observed`，不会从最终回答的自由文本里提取猜测性结论。Collector 只保留工具名、状态、错误码、路径和 workspace-change 信号；命令、工具输出、代码 diff、临时 checkpoint 和模型推理都不进入认知 Patch。
+
+### 可选的规则 + LLM 模式
+
+默认 `rules` 模式完全使用确定性规则。显式启用 `hybrid` 后，CodeY 会为 Collector 产生的终止事件、工具事件和 stale-path 信号分配稳定 `evidence_id`，并只把这份裁剪后的 Evidence Packet 交给 LLM Advisor：
+
+```bash
+python -m CodeY --evolution-mode hybrid "检查并修改运行时"
+```
+
+混合模式仍由规则掌握最终权限：
+
+- Outcome 的 `harmful`、明确失败和无结构化失败的成功是硬规则；LLM 只可把歧义的 `partial` 保持为 `partial` 或提升为 `incorrect`。
+- Root Cause 先由规则给出候选集合；LLM 只能在候选层级中消歧，安全或权限证据产生的 `policy` 不能降级。
+- Patch 类型、scope、correction kind 和生命周期状态由规则固定；LLM 只能精炼 `correction.action`，并把触发条件缩小到原规则条件的子集。
+- 每个被接受的建议必须引用真实 `evidence_id` 并达到置信度阈值；非法 JSON、伪造证据、秘密形态内容、diff 片段、provider 异常或低置信度都会回退到原规则候选。
+- Safety Gate 始终是纯规则组件，LLM 不能把 Patch 直接设为 `active`，也不能绕过 Policy/Definition 的人工审核。
+
+诊断只在 Outcome 或 Root Cause 存在规则歧义时调用；Patch Advisor 只在已有规则候选时调用。审计结果写入 `report.json` 的 `cognitive_loop.decision_audit`，仅保存 prompt 版本/hash、结构化建议状态、证据引用和回退错误码，不保存原始 prompt 或模型响应。Python API 可以复用主模型，也可以注入独立 critic：
+
+```python
+agent = CodeYAgent(
+    ...,
+    evolution_llm_config={
+        "mode": "hybrid",
+        "min_confidence": 0.8,
+        "max_new_tokens": 800,
+    },
+    evolution_llm_client=critic_client,  # 省略时复用 model_client
+)
+```
+
+> **启用前必读**：现有护栏不能消除语义误判、shadow 因果归因、prompt injection、外部 provider 隐私、人工治理、并发存储和长尾延迟风险。完整清单、状态和修复优先级见 [规则 + LLM 自进化闭环风险登记](docs/evolution-hybrid-risk-register.md)。
 
 Patch 是 JSON 对象，至少包含 `type`、`scope`、`correction`、`trigger_conditions`、`status`、`metrics` 和来源 run。状态转换为：
 

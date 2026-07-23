@@ -243,6 +243,11 @@ def build_agent(args):
     configured_secret_names = _configured_secret_names(args)
     store = SessionStore(workspace.repo_root + "/.codey/sessions")
     model = _build_model_client(args)
+    evolution_llm_config = {
+        "mode": getattr(args, "evolution_mode", "rules"),
+        "min_confidence": getattr(args, "evolution_llm_min_confidence", 0.75),
+        "max_new_tokens": getattr(args, "evolution_llm_max_new_tokens", 800),
+    }
     session_id = args.resume
     if session_id == "latest":
         session_id = store.latest()
@@ -257,6 +262,7 @@ def build_agent(args):
             max_new_tokens=args.max_new_tokens,
             secret_env_names=configured_secret_names,
             skill_mode=args.skill,
+            evolution_llm_config=evolution_llm_config,
         )
     return CodeYAgent(
         model_client=model,
@@ -267,6 +273,7 @@ def build_agent(args):
         max_new_tokens=args.max_new_tokens,
         secret_env_names=configured_secret_names,
         skill_mode=args.skill,
+        evolution_llm_config=evolution_llm_config,
     )
 
 
@@ -304,6 +311,24 @@ def build_arg_parser():
     )
     parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
+    parser.add_argument(
+        "--evolution-mode",
+        choices=("rules", "hybrid"),
+        default="rules",
+        help="Use deterministic cognitive evolution only, or bounded LLM advice with rule arbitration.",
+    )
+    parser.add_argument(
+        "--evolution-llm-min-confidence",
+        type=float,
+        default=0.75,
+        help="Minimum confidence required to accept bounded evolution LLM advice.",
+    )
+    parser.add_argument(
+        "--evolution-llm-max-new-tokens",
+        type=int,
+        default=800,
+        help="Maximum output tokens for each evolution advisor call.",
+    )
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
     return parser

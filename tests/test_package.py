@@ -7,9 +7,11 @@ import CodeY
 
 def test_public_package_and_cli():
     assert CodeY.CodeYAgent.__name__ == "CodeYAgent"
+    assert CodeY.EvolutionLLMConfig.__name__ == "EvolutionLLMConfig"
     result = subprocess.run([sys.executable, "-m", "CodeY", "--help"], capture_output=True, text=True, check=False)
     assert result.returncode == 0
     assert "--skill" in result.stdout
+    assert "--evolution-mode" in result.stdout
 
 
 def test_no_legacy_name_in_project_text():

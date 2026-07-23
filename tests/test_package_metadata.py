@@ -19,6 +19,7 @@ def test_public_package_and_cli_help():
     )
     assert result.returncode == 0
     assert "--skill" in result.stdout
+    assert "--evolution-mode" in result.stdout
 
 
 def test_package_metadata_and_metrics_imports():

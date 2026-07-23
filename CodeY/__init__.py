@@ -1,7 +1,7 @@
 from .cli import build_agent, build_arg_parser, build_welcome, main
 from .providers.clients import AnthropicCompatibleModelClient, FakeModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .core.runtime import CodeYAgent
-from .evolution import CognitiveLoop, EvolutionThresholds
+from .evolution import CognitiveLoop, EvolutionLLMConfig, EvolutionThresholds
 from .storage.session import SessionStore
 from .context.workspace import WorkspaceContext
 from .skills.hooks import HookManager, SessionStartEvent
@@ -12,6 +12,7 @@ __all__ = [
     "FakeModelClient",
     "CodeYAgent",
     "CognitiveLoop",
+    "EvolutionLLMConfig",
     "EvolutionThresholds",
     "build_agent",
     "build_arg_parser",

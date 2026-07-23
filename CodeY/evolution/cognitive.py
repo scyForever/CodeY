@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
 
+from .hybrid import HybridEvolutionAdvisor
+
 
 OUTCOMES = {"correct", "incorrect", "partial", "harmful"}
 PATCH_TYPES = {
@@ -125,7 +127,7 @@ class TraceCollector:
     @staticmethod
     def collect(task_state, tool_events, stale_paths=()):
         events = []
-        for raw in tool_events or ():
+        for index, raw in enumerate(tool_events or (), start=1):
             metadata = dict(raw.get("metadata", {}) or {})
             args = dict(raw.get("args", {}) or {})
             path = _safe_path(args.get("path", ""))
@@ -137,6 +139,7 @@ class TraceCollector:
             content = str(raw.get("content", "") or "")
             events.append(
                 {
+                    "evidence_id": f"tool_{index:03d}",
                     "name": _clip(raw.get("name", ""), 80),
                     "status": _clip(metadata.get("tool_status", ""), 40) or "unknown",
                     "error_code": _clip(metadata.get("tool_error_code", ""), 80),
@@ -148,17 +151,23 @@ class TraceCollector:
                     "has_content": bool(content.strip()) and not content.lstrip().lower().startswith("error:"),
                 }
             )
+        safe_stale_paths = sorted({_safe_path(path) for path in stale_paths if str(path or "").strip()})
         return {
             "run_id": str(task_state.run_id),
             "task_id": str(task_state.task_id),
             "task_status": str(task_state.status),
             "stop_reason": str(task_state.stop_reason),
+            "terminal_evidence_id": "task_terminal",
             "scope": {
                 "skill_name": str(task_state.skill_name or ""),
                 "route_id": str(task_state.route_id or ""),
             },
             "tool_events": events,
-            "stale_paths": sorted({_safe_path(path) for path in stale_paths if str(path or "").strip()}),
+            "stale_paths": safe_stale_paths,
+            "stale_evidence": [
+                {"evidence_id": f"stale_{index:03d}", "path": path}
+                for index, path in enumerate(safe_stale_paths, start=1)
+            ],
         }
 
 
@@ -168,15 +177,53 @@ class OutcomeEvaluator:
     @staticmethod
     def evaluate(trace):
         events = list(trace.get("tool_events", []))
-        if any(event["status"] == "partial_success" and event["workspace_changed"] for event in events):
-            return {"label": "harmful", "reason": "failed_action_changed_workspace"}
+        harmful_events = [
+            event for event in events if event["status"] == "partial_success" and event["workspace_changed"]
+        ]
+        if harmful_events:
+            return {
+                "label": "harmful",
+                "reason": "failed_action_changed_workspace",
+                "evidence_refs": [event["evidence_id"] for event in harmful_events],
+                "decisive": True,
+                "decision_source": "rules",
+            }
         if trace.get("task_status") == "failed":
-            return {"label": "incorrect", "reason": trace.get("stop_reason") or "task_failed"}
+            return {
+                "label": "incorrect",
+                "reason": trace.get("stop_reason") or "task_failed",
+                "evidence_refs": [trace.get("terminal_evidence_id", "task_terminal")],
+                "decisive": True,
+                "decision_source": "rules",
+            }
         if trace.get("task_status") != "completed":
-            return {"label": "incorrect", "reason": trace.get("stop_reason") or "task_not_completed"}
-        if any(event["status"] in {"partial_success", "error", "rejected", "unknown"} for event in events):
-            return {"label": "partial", "reason": "completed_after_tool_failure"}
-        return {"label": "correct", "reason": "completed_without_structured_failure"}
+            return {
+                "label": "incorrect",
+                "reason": trace.get("stop_reason") or "task_not_completed",
+                "evidence_refs": [trace.get("terminal_evidence_id", "task_terminal")],
+                "decisive": True,
+                "decision_source": "rules",
+            }
+        failed_events = [
+            event
+            for event in events
+            if event["status"] in {"partial_success", "error", "rejected", "unknown"}
+        ]
+        if failed_events:
+            return {
+                "label": "partial",
+                "reason": "completed_after_tool_failure",
+                "evidence_refs": [event["evidence_id"] for event in failed_events],
+                "decisive": False,
+                "decision_source": "rules",
+            }
+        return {
+            "label": "correct",
+            "reason": "completed_without_structured_failure",
+            "evidence_refs": [trace.get("terminal_evidence_id", "task_terminal")],
+            "decisive": True,
+            "decision_source": "rules",
+        }
 
 
 class RootCauseAnalyzer:
@@ -186,13 +233,32 @@ class RootCauseAnalyzer:
 
     @classmethod
     def analyze(cls, trace, outcome):
+        del outcome
+        candidates = cls.candidates(trace)
+        return candidates[0] if candidates else None
+
+    @classmethod
+    def candidates(cls, trace):
+        """Return ordered, evidence-backed candidates for optional LLM disambiguation."""
         failures = [event for event in trace.get("tool_events", []) if event.get("status") != "ok"]
         if not failures:
             if trace.get("stop_reason") == "retry_limit_reached":
-                return cls._result("strategy", "retry_limit_reached")
+                return [
+                    cls._result(
+                        "strategy",
+                        "retry_limit_reached",
+                        trace.get("terminal_evidence_id", "task_terminal"),
+                    )
+                ]
             if trace.get("stop_reason") == "step_limit_reached":
-                return cls._result("chain", "step_limit_reached")
-            return None
+                return [
+                    cls._result(
+                        "chain",
+                        "step_limit_reached",
+                        trace.get("terminal_evidence_id", "task_terminal"),
+                    )
+                ]
+            return []
 
         policy_event = next(
             (
@@ -203,27 +269,30 @@ class RootCauseAnalyzer:
             None,
         )
         if policy_event:
-            return cls._event_result("policy", policy_event)
+            return [cls._event_result("policy", policy_event)]
 
+        candidates = []
         strategy_event = next(
             (event for event in failures if event.get("error_code") == "repeated_identical_call"),
             None,
         )
         if strategy_event or trace.get("stop_reason") == "retry_limit_reached":
-            return cls._event_result("strategy", strategy_event or failures[-1])
+            candidates.append(cls._event_result("strategy", strategy_event or failures[-1]))
 
         if trace.get("stop_reason") == "step_limit_reached" or len(trace.get("tool_events", [])) > 1:
-            return cls._event_result("chain", failures[-1])
-        return cls._event_result("execution", failures[-1])
+            candidates.append(cls._event_result("chain", failures[-1]))
+        candidates.append(cls._event_result("execution", failures[-1]))
+        return candidates
 
     @staticmethod
-    def _result(level, trigger):
+    def _result(level, trigger, evidence_ref="task_terminal"):
         return {
             "level": level,
             "trigger": trigger,
             "tool": "",
             "error_code": "",
             "security_event_type": "",
+            "evidence_refs": [evidence_ref],
         }
 
     @staticmethod
@@ -234,6 +303,7 @@ class RootCauseAnalyzer:
             "tool": event.get("name", ""),
             "error_code": event.get("error_code", ""),
             "security_event_type": event.get("security_event_type", ""),
+            "evidence_refs": [event.get("evidence_id", "")],
         }
 
 
@@ -266,7 +336,14 @@ class PatchGenerator:
             if path in seen_paths:
                 continue
             seen_paths.add(path)
-            facts.append({"kind": "verified_repository_path", "path": path, "tool": event.get("name", "")})
+            facts.append(
+                {
+                    "kind": "verified_repository_path",
+                    "path": path,
+                    "tool": event.get("name", ""),
+                    "evidence_id": event.get("evidence_id", ""),
+                }
+            )
         return _dedupe(facts)[:2]
 
     def _failure_patch(self, trace, outcome, root_cause):
@@ -310,10 +387,15 @@ class PatchGenerator:
                 ]
             ),
             target_tool=root_cause.get("tool", ""),
+            evidence_refs=root_cause.get("evidence_refs", []),
         )
 
     def _stale_patch(self, trace, outcome):
         paths = list(trace.get("stale_paths", []))[:3]
+        evidence_by_path = {
+            item.get("path", ""): item.get("evidence_id", "")
+            for item in trace.get("stale_evidence", [])
+        }
         path_text = ", ".join(f"`{path}`" for path in paths)
         return self._candidate(
             trace,
@@ -323,6 +405,7 @@ class PatchGenerator:
             correction_kind="freshness_guard",
             action=f"Revalidate {path_text} before relying on a previous memory summary.",
             trigger_conditions=[{"signal": "path", "equals": path} for path in paths],
+            evidence_refs=[evidence_by_path[path] for path in paths if evidence_by_path.get(path)],
         )
 
     def _knowledge_patches(self, trace, outcome):
@@ -350,6 +433,7 @@ class PatchGenerator:
                     action=action,
                     trigger_conditions=[{"signal": "path", "equals": path}],
                     target_tool=fact.get("tool", ""),
+                    evidence_refs=[fact.get("evidence_id", "")],
                 )
             )
         return patches
@@ -365,11 +449,12 @@ class PatchGenerator:
         action,
         trigger_conditions,
         target_tool="",
+        evidence_refs=(),
     ):
         scope = dict(trace.get("scope", {}))
         if target_tool:
             scope["target_tool"] = target_tool
-        return {
+        candidate = {
             "type": patch_type,
             "scope": scope,
             "correction": {
@@ -384,14 +469,24 @@ class PatchGenerator:
                 "root_cause_level": (root_cause or {}).get("level", ""),
                 "root_cause_trigger": (root_cause or {}).get("trigger", ""),
                 "root_cause_tool": (root_cause or {}).get("tool", ""),
+                "proposal_origin": "rules",
+                "evidence_refs": [str(item) for item in evidence_refs if str(item)],
             },
         }
+        identity_payload = {
+            key: candidate[key]
+            for key in ("type", "scope", "correction", "trigger_conditions")
+        }
+        candidate["source"]["rule_candidate_fingerprint"] = hashlib.sha256(
+            json.dumps(identity_payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+        ).hexdigest()
+        return candidate
 
 
 class EvolutionStore:
     """Persist structured patches and derived human-readable knowledge views."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, root):
         self.root = Path(root)
@@ -417,18 +512,27 @@ class EvolutionStore:
             key: candidate[key]
             for key in ("type", "scope", "correction", "trigger_conditions")
         }
-        fingerprint = hashlib.sha256(
+        content_fingerprint = hashlib.sha256(
             json.dumps(fingerprint_payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
         ).hexdigest()
-        patch_id = "patch_" + fingerprint[:16]
+        rule_fingerprint = str(candidate.get("source", {}).get("rule_candidate_fingerprint", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", rule_fingerprint):
+            rule_fingerprint = content_fingerprint
+        patch_id = "patch_" + rule_fingerprint[:16]
         path = self.patches_dir / f"{patch_id}.json"
         if path.exists():
             return self.load_patch(patch_id), False
         timestamp = _utc_now()
+        generation_reason = (
+            "hybrid_supervised_generation"
+            if candidate.get("source", {}).get("proposal_origin") == "hybrid_llm"
+            else "rule_supervised_generation"
+        )
         patch = {
             "schema_version": self.SCHEMA_VERSION,
             "patch_id": patch_id,
-            "fingerprint": fingerprint,
+            "fingerprint": content_fingerprint,
+            "rule_candidate_fingerprint": rule_fingerprint,
             **candidate,
             "status": "draft",
             "metrics": {
@@ -445,7 +549,7 @@ class EvolutionStore:
                 {
                     "from": "",
                     "to": "draft",
-                    "reason": "rule_supervised_generation",
+                    "reason": generation_reason,
                     "at": timestamp,
                 }
             ],
@@ -646,11 +750,12 @@ class SafetyGate:
 class CognitiveLoop:
     """Orchestrate trace collection, evaluation, attribution, and rollout."""
 
-    def __init__(self, root, thresholds=None):
+    def __init__(self, root, thresholds=None, llm_client=None, llm_config=None):
         self.thresholds = EvolutionThresholds.from_value(thresholds)
         self.store = EvolutionStore(Path(root) / ".codey" / "evolution")
         self.generator = PatchGenerator()
         self.safety_gate = SafetyGate(self.store, self.thresholds)
+        self.advisor = HybridEvolutionAdvisor(client=llm_client, config=llm_config)
 
     def prepare_run(self, task_state):
         eligible_ids = []
@@ -675,6 +780,7 @@ class CognitiveLoop:
             "active_patch_ids": active_ids,
             "shadow_patch_ids": shadow_ids,
             "thresholds": self.thresholds.to_dict(),
+            "llm_advisor": self.advisor.config.to_dict(),
         }
         lines = ["Adaptive cognitive patches:"]
         for mode, patch in guidance[:8]:
@@ -686,15 +792,47 @@ class CognitiveLoop:
         if redactor is not None:
             trace["scope"] = redactor(trace.get("scope", {}))
             trace["stale_paths"] = redactor(trace.get("stale_paths", []))
+            for item in trace.get("stale_evidence", []):
+                item["path"] = redactor(item.get("path", ""))
             for event in trace.get("tool_events", []):
                 event["path"] = redactor(event.get("path", ""))
                 event["affected_paths"] = redactor(event.get("affected_paths", []))
-        outcome = OutcomeEvaluator.evaluate(trace)
+        rule_outcome = OutcomeEvaluator.evaluate(trace)
+        rule_root_cause = RootCauseAnalyzer.analyze(trace, rule_outcome)
+        root_candidates = RootCauseAnalyzer.candidates(trace)
+        try:
+            outcome, root_cause, diagnostic_audit, patch_eligible = self.advisor.diagnose(
+                trace,
+                rule_outcome,
+                rule_root_cause,
+                root_candidates,
+            )
+        except Exception as exc:
+            outcome = rule_outcome
+            root_cause = rule_root_cause
+            patch_eligible = True
+            diagnostic_audit = {
+                "mode": self.advisor.config.mode,
+                "status": "fallback_internal_error",
+                "error_type": type(exc).__name__,
+            }
         if outcome["label"] not in OUTCOMES:
             raise ValueError(f"invalid normalized outcome: {outcome['label']}")
-        root_cause = RootCauseAnalyzer.analyze(trace, outcome)
         transitions = self._observe_existing(task_state, trace, outcome)
-        candidates = self.generator.generate(trace, outcome, root_cause)
+        rule_candidates = self.generator.generate(trace, outcome, root_cause)
+        try:
+            candidates, patch_audit = self.advisor.refine_patches(
+                trace,
+                rule_candidates,
+                patch_eligible=patch_eligible,
+            )
+        except Exception as exc:
+            candidates = rule_candidates
+            patch_audit = {
+                "mode": self.advisor.config.mode,
+                "status": "fallback_internal_error",
+                "error_type": type(exc).__name__,
+            }
         generated = []
         for candidate in candidates:
             patch, created = self.store.create_candidate(candidate)
@@ -709,6 +847,8 @@ class CognitiveLoop:
                     "scope": dict(patch["scope"]),
                     "correction": dict(patch["correction"]),
                     "trigger_conditions": list(patch["trigger_conditions"]),
+                    "proposal_origin": patch.get("source", {}).get("proposal_origin", "rules"),
+                    "evidence_refs": list(patch.get("source", {}).get("evidence_refs", [])),
                 }
             )
         if transitions:
@@ -721,6 +861,10 @@ class CognitiveLoop:
             "root_cause": root_cause,
             "generated_patches": generated,
             "patch_transitions": transitions,
+            "decision_audit": {
+                "diagnostic": diagnostic_audit,
+                "patch_generation": patch_audit,
+            },
         }
 
     def approve_patch(self, patch_id):

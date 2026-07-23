@@ -14,7 +14,14 @@ FAST_THRESHOLDS = {
 }
 
 
-def build_agent(tmp_path, outputs, thresholds=None, feature_flags=None):
+def build_agent(
+    tmp_path,
+    outputs,
+    thresholds=None,
+    feature_flags=None,
+    evolution_llm_config=None,
+    evolution_llm_client=None,
+):
     (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
     client = FakeModelClient(outputs)
     agent = CodeYAgent(
@@ -25,6 +32,8 @@ def build_agent(tmp_path, outputs, thresholds=None, feature_flags=None):
         skill_mode="off",
         feature_flags=feature_flags,
         evolution_thresholds=thresholds or FAST_THRESHOLDS,
+        evolution_llm_config=evolution_llm_config,
+        evolution_llm_client=evolution_llm_client,
     )
     return agent, client
 
@@ -371,3 +380,267 @@ def test_old_task_state_without_evolution_context_is_still_loadable():
 
     assert state.evolution_context == {}
     assert state.to_dict()["evolution_context"] == {}
+
+
+def test_hybrid_advisor_disambiguates_root_cause_and_refines_patch(tmp_path):
+    advisor = FakeModelClient(
+        [
+            json.dumps(
+                {
+                    "outcome": {
+                        "label": "incorrect",
+                        "confidence": 0.94,
+                        "evidence_refs": ["tool_001"],
+                        "reason_code": "critical_tool_failure",
+                        "patch_eligible": True,
+                    },
+                    "root_cause": {
+                        "level": "execution",
+                        "confidence": 0.91,
+                        "evidence_refs": ["tool_001"],
+                        "cause_code": "invalid_tool_arguments",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "patches": [
+                        {
+                            "candidate_index": 0,
+                            "correction_action": "Validate read_file path arguments before execution.",
+                            "trigger_conditions": [{"signal": "tool_name", "equals": "read_file"}],
+                            "confidence": 0.9,
+                            "evidence_refs": ["tool_001"],
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+    agent, main_client = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"read_file","args":{"start":1,"end":2}}</tool>',
+            '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":2}}</tool>',
+            "<final>recovered</final>",
+        ],
+        evolution_llm_config={"mode": "hybrid", "min_confidence": 0.8},
+        evolution_llm_client=advisor,
+    )
+
+    assert agent.ask("inspect runtime") == "recovered"
+
+    result = agent.last_cognitive_loop
+    assert result["outcome"]["label"] == "incorrect"
+    assert result["outcome"]["decision_source"] == "hybrid_llm"
+    assert result["root_cause"]["level"] == "execution"
+    assert result["root_cause"]["decision_source"] == "hybrid_llm"
+    assert result["decision_audit"]["diagnostic"]["status"] == "accepted"
+    assert result["decision_audit"]["patch_generation"]["status"] == "accepted"
+
+    strategy = patches_by_type(agent, "strategy")[0]
+    assert strategy["status"] == "shadow"
+    assert strategy["correction"]["kind"] == "execution_guard"
+    assert strategy["correction"]["action"] == "Validate read_file path arguments before execution."
+    assert strategy["source"]["proposal_origin"] == "hybrid_llm"
+    assert strategy["source"]["advisor_evidence_refs"] == ["tool_001"]
+    assert len(advisor.prompts) == 2
+    assert len(main_client.prompts) == 3
+
+
+def test_hybrid_advisor_rejects_unverifiable_or_secret_shaped_advice(tmp_path):
+    leaked_value = "sk-LEAKEDVALUE123456"
+    advisor = FakeModelClient(
+        [
+            json.dumps(
+                {
+                    "outcome": {
+                        "label": "incorrect",
+                        "confidence": 0.99,
+                        "evidence_refs": ["invented_evidence"],
+                        "reason_code": "unsupported_claim",
+                        "patch_eligible": True,
+                    },
+                    "root_cause": {
+                        "level": "execution",
+                        "confidence": 0.99,
+                        "evidence_refs": ["invented_evidence"],
+                        "cause_code": "unsupported_cause",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "patches": [
+                        {
+                            "candidate_index": 0,
+                            "correction_action": f"Reuse secret token {leaked_value} before every read.",
+                            "trigger_conditions": [{"signal": "tool_name", "equals": "read_file"}],
+                            "confidence": 0.99,
+                            "evidence_refs": ["tool_001"],
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+    agent, _ = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"read_file","args":{"start":1,"end":2}}</tool>',
+            '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":2}}</tool>',
+            "<final>recovered</final>",
+        ],
+        evolution_llm_config={"mode": "hybrid"},
+        evolution_llm_client=advisor,
+    )
+
+    agent.ask("inspect runtime")
+
+    result = agent.last_cognitive_loop
+    assert result["outcome"]["label"] == "partial"
+    assert result["root_cause"]["level"] == "chain"
+    assert result["decision_audit"]["diagnostic"]["status"] == "fallback_validation_failed"
+    assert result["decision_audit"]["patch_generation"]["status"] == "fallback_validation_failed"
+    chain = patches_by_type(agent, "action_chain")[0]
+    assert chain["source"]["proposal_origin"] == "rules"
+    serialized = json.dumps({"result": result, "patch": chain}, sort_keys=True)
+    assert leaked_value not in serialized
+    assert "invented_evidence" not in serialized
+
+
+def test_hybrid_patch_identity_is_stable_across_llm_paraphrases(tmp_path):
+    diagnostic = json.dumps(
+        {
+            "outcome": {
+                "label": "partial",
+                "confidence": 0.9,
+                "evidence_refs": ["tool_001"],
+                "reason_code": "completed_after_tool_failure",
+                "patch_eligible": True,
+            },
+            "root_cause": None,
+        }
+    )
+    first_patch = json.dumps(
+        {
+            "patches": [
+                {
+                    "candidate_index": 0,
+                    "correction_action": "Validate the read path before invoking read_file.",
+                    "trigger_conditions": [{"signal": "tool_name", "equals": "read_file"}],
+                    "confidence": 0.9,
+                    "evidence_refs": ["tool_001"],
+                }
+            ]
+        }
+    )
+    paraphrased_patch = json.dumps(
+        {
+            "patches": [
+                {
+                    "candidate_index": 0,
+                    "correction_action": "Check the requested path before calling read_file.",
+                    "trigger_conditions": [{"signal": "tool_name", "equals": "read_file"}],
+                    "confidence": 0.92,
+                    "evidence_refs": ["tool_001"],
+                }
+            ]
+        }
+    )
+    advisor = FakeModelClient([diagnostic, first_patch, diagnostic, paraphrased_patch])
+    agent, _ = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"read_file","args":{"start":1,"end":2}}</tool>',
+            "<final>recovered</final>",
+            '<tool>{"name":"read_file","args":{"start":1,"end":2}}</tool>',
+            "<final>recovered again</final>",
+        ],
+        evolution_llm_config={"mode": "hybrid"},
+        evolution_llm_client=advisor,
+    )
+
+    agent.ask("inspect runtime")
+    first = patches_by_type(agent, "strategy")[0]
+    agent.ask("inspect runtime again")
+
+    patches = patches_by_type(agent, "strategy")
+    assert len(patches) == 1
+    assert patches[0]["patch_id"] == first["patch_id"]
+    assert patches[0]["correction"]["action"] == "Validate the read path before invoking read_file."
+    assert agent.last_cognitive_loop["generated_patches"][0]["created"] is False
+
+
+def test_hybrid_advisor_cannot_override_policy_review_state(tmp_path):
+    advisor = FakeModelClient(
+        [
+            json.dumps(
+                {
+                    "outcome": {
+                        "label": "partial",
+                        "confidence": 0.95,
+                        "evidence_refs": ["tool_001"],
+                        "reason_code": "blocked_policy_violation",
+                        "patch_eligible": True,
+                    },
+                    "root_cause": {
+                        "level": "execution",
+                        "confidence": 0.99,
+                        "evidence_refs": ["tool_001"],
+                        "cause_code": "downgrade_policy",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "patches": [
+                        {
+                            "candidate_index": 0,
+                            "correction_action": "Resolve paths inside the workspace before reading.",
+                            "trigger_conditions": [{"signal": "tool_name", "equals": "read_file"}],
+                            "confidence": 0.95,
+                            "evidence_refs": ["tool_001"],
+                            "status": "active",
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+    agent, _ = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"read_file","args":{"path":"../outside.txt","start":1,"end":1}}</tool>',
+            "<final>recovered</final>",
+        ],
+        evolution_llm_config={"mode": "hybrid"},
+        evolution_llm_client=advisor,
+    )
+
+    agent.ask("inspect a path")
+
+    policy = patches_by_type(agent, "policy")[0]
+    assert agent.last_cognitive_loop["root_cause"]["level"] == "policy"
+    assert policy["status"] == "review_required"
+    assert policy["source"]["proposal_origin"] == "rules"
+    assert agent.last_cognitive_loop["decision_audit"]["patch_generation"]["status"] == (
+        "fallback_validation_failed"
+    )
+    assert not (tmp_path / ".codey" / "evolution" / "behavior" / "policies.md").exists()
+
+
+def test_hybrid_advisor_is_not_called_when_rules_are_decisive_and_no_patch_exists(tmp_path):
+    advisor = FakeModelClient(["unused"])
+    agent, _ = build_agent(
+        tmp_path,
+        ["<final>done</final>"],
+        evolution_llm_config={"mode": "hybrid"},
+        evolution_llm_client=advisor,
+    )
+
+    assert agent.ask("finish") == "done"
+    assert advisor.prompts == []
+    assert agent.last_cognitive_loop["outcome"]["label"] == "correct"
+    assert agent.last_cognitive_loop["decision_audit"]["diagnostic"]["status"] == "skipped_rule_decisive"
+    assert agent.last_cognitive_loop["decision_audit"]["patch_generation"]["status"] == "skipped_no_candidates"
