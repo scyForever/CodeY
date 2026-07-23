@@ -16,6 +16,7 @@ from ..storage import checkpoint as checkpointlib
 from ..memory import store as memorylib
 from ..tools import security as securitylib
 from ..context.manager import ContextManager
+from ..evolution import CognitiveLoop
 from ..storage.checkpoint import CHECKPOINT_NONE_STATUS
 from ..context.prompt_prefix import build_prompt_prefix, tool_signature
 from ..storage.run import RunStore
@@ -34,6 +35,7 @@ DEFAULT_FEATURE_FLAGS = {
     "relevant_memory": True,
     "context_reduction": True,
     "prompt_cache": True,
+    "self_evolution": True,
 }
 DURABLE_MEMORY_INTENT_PATTERN = re.compile(r"(?i)\b(capture|remember|save|store|persist|note)\b")
 DURABLE_MEMORY_INTENT_ZH_PATTERN = re.compile(r"(记住|保存|记录|沉淀|长期记忆|持久记忆)")
@@ -72,6 +74,7 @@ class CodeYAgent:
         allowed_tools=None,
         skill_mode="auto",
         hook_callbacks=None,
+        evolution_thresholds=None,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -95,6 +98,7 @@ class CodeYAgent:
         self.current_route = RouteMatch()
         self._compact_hook_run_id = ""
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".codey" / "runs")
+        self.cognitive_loop = CognitiveLoop(self.root, thresholds=evolution_thresholds)
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
@@ -124,6 +128,9 @@ class CodeYAgent:
         self.last_durable_promotions = []
         self.last_durable_rejections = []
         self.last_durable_superseded = []
+        self.last_cognitive_loop = {}
+        self._cognitive_guidance = ""
+        self._stale_memory_paths = []
         self._last_tool_result_metadata = {}
         self._last_prefix_refresh = {
             "workspace_changed": False,
@@ -279,7 +286,67 @@ class CodeYAgent:
         return dict(self._last_prefix_refresh)
 
     def memory_text(self):
-        return self.memory.render_memory_text()
+        text = self.memory.render_memory_text()
+        if self.feature_enabled("self_evolution") and self._cognitive_guidance:
+            text += "\n\n" + self._cognitive_guidance
+        return text
+
+    def prepare_cognitive_context(self, task_state):
+        self._stale_memory_paths = []
+        self.last_cognitive_loop = {}
+        if not self.feature_enabled("self_evolution"):
+            task_state.evolution_context = {"enabled": False}
+            self._cognitive_guidance = ""
+            return dict(task_state.evolution_context)
+        try:
+            context, guidance = self.cognitive_loop.prepare_run(task_state)
+        except Exception as exc:
+            context = {
+                "enabled": False,
+                "error_type": type(exc).__name__,
+            }
+            guidance = ""
+        task_state.evolution_context = context
+        self._cognitive_guidance = guidance
+        return dict(context)
+
+    def process_cognitive_loop(self, task_state, tool_events):
+        if not self.feature_enabled("self_evolution"):
+            self.last_cognitive_loop = {"status": "disabled"}
+            return dict(self.last_cognitive_loop)
+        try:
+            result = self.cognitive_loop.complete_run(
+                task_state,
+                tool_events,
+                stale_paths=self._stale_memory_paths,
+                redactor=self.redact_artifact,
+            )
+            self.last_cognitive_loop = self.redact_artifact(result)
+            self.emit_trace(
+                task_state,
+                "cognitive_loop_completed",
+                {
+                    "status": self.last_cognitive_loop.get("status", ""),
+                    "outcome": self.last_cognitive_loop.get("outcome", {}),
+                    "root_cause": self.last_cognitive_loop.get("root_cause"),
+                    "generated_patches": self.last_cognitive_loop.get("generated_patches", []),
+                    "patch_transitions": self.last_cognitive_loop.get("patch_transitions", []),
+                },
+            )
+        except Exception as exc:
+            self.last_cognitive_loop = {
+                "status": "error",
+                "error_type": type(exc).__name__,
+            }
+            try:
+                self.emit_trace(task_state, "cognitive_loop_failed", dict(self.last_cognitive_loop))
+            except Exception:
+                pass
+        return dict(self.last_cognitive_loop)
+
+    def approve_cognitive_patch(self, patch_id):
+        """Activate one human-reviewed patch and refresh its knowledge view."""
+        return self.cognitive_loop.approve_patch(patch_id)
 
     def history_text(self):
         history = self.session["history"]
@@ -464,6 +531,9 @@ class CodeYAgent:
             self.memory.set_file_summary(canonical_path, summary)
             self.memory.append_note(summary, tags=(canonical_path,), source=canonical_path)
         elif name in {"write_file", "patch_file"}:
+            summaries = dict(self.memory.to_dict().get("file_summaries", {}))
+            if canonical_path in summaries and canonical_path not in self._stale_memory_paths:
+                self._stale_memory_paths.append(canonical_path)
             self.memory.invalidate_file_summary(canonical_path)
 
     def note_tool(self, name, args, result):
@@ -612,6 +682,7 @@ class CodeYAgent:
             "durable_promotions": list(self.last_durable_promotions),
             "durable_rejections": list(self.last_durable_rejections),
             "durable_superseded": list(self.last_durable_superseded),
+            "cognitive_loop": dict(self.last_cognitive_loop),
             "redacted_env": self.detected_secret_env_summary(),
             "skill_route": self.current_route.to_dict(),
             "session_context": dict(self.session.get("session_context", {})),
@@ -649,6 +720,7 @@ class CodeYAgent:
             read_only=True,
             secret_env_names=self.secret_env_names,
             shell_env_allowlist=self.shell_env_allowlist,
+            feature_flags={**self.feature_flags, "self_evolution": False},
             skill_mode=self.skill_mode,
         )
         # 委派的目标是“调查”，不是“放权执行”。

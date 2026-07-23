@@ -1,0 +1,27 @@
+{
+  "_comment": "Claude Code project-wide settings. Hook schema uses nested hooks[].{type,command}. SessionStart re-injects SKILL.md; PreToolUse gates rules/agent-behavior.md edits per ANTI-TEMPLATES.md § Admission Threshold.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/session-start"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash templates/hooks/agent-behavior-gate.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

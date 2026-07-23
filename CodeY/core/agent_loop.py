@@ -25,6 +25,7 @@ class AgentLoop:
         task_state.route_fallback = route.fallback
         task_state.route_match_terms = route.matched_terms
         agent.current_task_state = task_state
+        agent.prepare_cognitive_context(task_state)
         agent.current_run_dir = agent.run_store.start_run(task_state)
         agent.emit_trace(
             task_state,
@@ -33,11 +34,13 @@ class AgentLoop:
                 "task_id": task_state.task_id,
                 "user_request": clip(user_message, 300),
                 "skill_route": route.to_dict(),
+                "evolution_context": dict(task_state.evolution_context),
             },
         )
 
         tool_steps = 0
         attempts = 0
+        tool_events = []
         max_attempts = max(agent.max_steps * 3, agent.max_steps + 4)
 
         # 这是 agent 的主循环，可以按“感知 -> 决策 -> 行动 -> 记录”来理解：
@@ -116,13 +119,25 @@ class AgentLoop:
                 # 只有后端明确支持时，才把稳定前缀的 hash 作为 cache key 发出去。
                 prompt_cache_key = prompt_metadata.get("prompt_cache_key")
                 prompt_cache_retention = "in_memory"
+            agent.last_prompt_metadata = prompt_metadata
             model_started_at = time.monotonic()
-            raw = agent.model_client.complete(
-                prompt,
-                agent.max_new_tokens,
-                prompt_cache_key=prompt_cache_key,
-                prompt_cache_retention=prompt_cache_retention,
-            )
+            try:
+                raw = agent.model_client.complete(
+                    prompt,
+                    agent.max_new_tokens,
+                    prompt_cache_key=prompt_cache_key,
+                    prompt_cache_retention=prompt_cache_retention,
+                )
+            except Exception as exc:
+                final = f"Task failed because the model provider raised {type(exc).__name__}."
+                task_state.stop_model_error(final)
+                agent.record({"role": "assistant", "content": final, "created_at": now()})
+                agent.emit_trace(
+                    task_state,
+                    "model_failed",
+                    {"error_type": type(exc).__name__},
+                )
+                return self._finish_run(task_state, user_message, final, run_started_at, tool_events)
             completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
             if completion_metadata:
                 # 把后端返回的 usage/cache 统计并回 prompt_metadata，
@@ -149,6 +164,14 @@ class AgentLoop:
                 tool_started_at = time.monotonic()
                 tool_result = agent.execute_tool(name, args)
                 result = tool_result.content
+                tool_events.append(
+                    {
+                        "name": name,
+                        "args": dict(args),
+                        "content": result,
+                        "metadata": dict(tool_result.metadata or {}),
+                    }
+                )
                 agent.record(
                     {
                         "role": "tool",
@@ -190,29 +213,7 @@ class AgentLoop:
             final = (payload or raw).strip()
             agent.record({"role": "assistant", "content": final, "created_at": now()})
             task_state.finish_success(final)
-            agent.promote_durable_memory(user_message, final)
-            checkpoint = agent.create_checkpoint(task_state, user_message, trigger="run_finished")
-            agent.run_store.write_task_state(task_state)
-            agent.emit_trace(
-                task_state,
-                "checkpoint_created",
-                {
-                    "checkpoint_id": checkpoint["checkpoint_id"],
-                    "trigger": "run_finished",
-                },
-            )
-            agent.emit_trace(
-                task_state,
-                "run_finished",
-                {
-                    "status": task_state.status,
-                    "stop_reason": task_state.stop_reason,
-                    "final_answer": final,
-                    "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
-                },
-            )
-            agent.run_store.write_report(task_state, agent.redact_artifact(agent.build_report(task_state)))
-            return final
+            return self._finish_run(task_state, user_message, final, run_started_at, tool_events)
 
         if attempts >= max_attempts and tool_steps < agent.max_steps:
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."
@@ -221,17 +222,24 @@ class AgentLoop:
             final = "Stopped after reaching the step limit without a final answer."
             task_state.stop_step_limit(final)
         agent.record({"role": "assistant", "content": final, "created_at": now()})
+        return self._finish_run(task_state, user_message, final, run_started_at, tool_events)
+
+    def _finish_run(self, task_state, user_message, final, run_started_at, tool_events):
+        agent = self.agent
         agent.promote_durable_memory(user_message, final)
+        checkpoint_trigger = "run_finished" if task_state.status == "completed" else task_state.stop_reason or "run_stopped"
+        checkpoint = agent.create_checkpoint(task_state, user_message, trigger=checkpoint_trigger)
         agent.run_store.write_task_state(task_state)
-        checkpoint = agent.create_checkpoint(task_state, user_message, trigger=task_state.stop_reason or "run_stopped")
         agent.emit_trace(
             task_state,
             "checkpoint_created",
             {
                 "checkpoint_id": checkpoint["checkpoint_id"],
-                "trigger": task_state.stop_reason or "run_stopped",
+                "trigger": checkpoint_trigger,
             },
         )
+        agent.process_cognitive_loop(task_state, tool_events)
+        agent.run_store.write_report(task_state, agent.redact_artifact(agent.build_report(task_state)))
         agent.emit_trace(
             task_state,
             "run_finished",
@@ -242,5 +250,4 @@ class AgentLoop:
                 "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
             },
         )
-        agent.run_store.write_report(task_state, agent.redact_artifact(agent.build_report(task_state)))
         return final

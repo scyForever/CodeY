@@ -14,6 +14,7 @@ CodeY 是一个面向本地代码仓库的小型 Coding Agent Runtime。它将�
 - **分段上下文预算**：稳定 prefix、route context、memory、相关记忆、历史和当前请求分别管理；当前请求不会被裁剪。
 - **工具安全边界**：工作区路径约束、参数校验、重复调用防护、危险操作审批、只读子 Agent 和 secret redaction。
 - **可恢复与可审计**：会话、检查点、工作记忆、trace、task state 和 report 持久化到 `.codey/`。
+- **规则监督的认知闭环**：任务结束后基于结构化 trace 完成自省、结果归一化、根因归类、Patch 灰度和知识路由；不会从模型自由文本中猜测性学习。
 - **评测工具**：包含固定任务评测、上下文/记忆/恢复/安全实验与 provider 实验脚本。
 
 ## 架构
@@ -31,7 +32,8 @@ CLI
        ├─ ContextManager（route、memory、history、request）
        ├─ AgentLoop
        │    ├─ ModelClient
-       │    └─ ToolExecutor
+       │    ├─ ToolExecutor
+       │    └─ CognitiveLoop（trace、outcome、root cause、patch gate）
        └─ Session / Checkpoint / Run / Memory stores
 ```
 
@@ -45,6 +47,7 @@ CodeY/
 ├─ tools/         # 工具注册、执行器、安全和上下文
 ├─ storage/       # Session、Checkpoint、Run artifacts
 ├─ memory/        # 工作记忆与 durable memory
+├─ evolution/     # 规则监督的任务后认知闭环与 Patch 状态机
 ├─ providers/     # 模型后端适配器
 └─ evaluation/    # 固定评测与指标实验
 skills/codey/     # 当前仓库自身的示例/维护 Skill
@@ -285,9 +288,16 @@ codey --approval never # 拒绝危险操作
 │  ├─ task_state.json
 │  ├─ trace.jsonl
 │  └─ report.json
-└─ memory/
+├─ memory/
    ├─ MEMORY.md
    └─ topics/*.md
+└─ evolution/
+   ├─ patches/patch_*.json
+   ├─ behavior/policies.md
+   ├─ decisions.md
+   └─ knowledge/
+      ├─ definition/*.md
+      └─ experience/*.md
 ```
 
 - **session**：可恢复的历史、memory、checkpoint 和 session context。
@@ -295,6 +305,31 @@ codey --approval never # 拒绝危险操作
 - **trace**：逐事件时间线。
 - **report**：一次运行的结果与关键 metadata。
 - **checkpoint**：用于新鲜度、工作区不匹配和压缩后的恢复。
+
+## 规则监督的自进化认知闭环
+
+每个顶层 `ask()` 终结后都会执行一条确定性链路：
+
+```text
+Trace Collector
+  -> Outcome Evaluator (correct / incorrect / partial / harmful)
+  -> Root Cause Analyzer (policy / strategy / chain / execution)
+  -> Patch Generator
+  -> Safety Gate
+  -> patch store + knowledge views
+```
+
+自省结果固定回答三个问题，并写入 `report.json` 的 `cognitive_loop.reflection`：本次是否观察到新知识、是否出现错误路线、是否确认有过时知识。没有结构化证据时返回 `no` 或 `not_observed`，不会从最终回答的自由文本里提取猜测性结论。Collector 只保留工具名、状态、错误码、路径和 workspace-change 信号；命令、工具输出、代码 diff、临时 checkpoint 和模型推理都不进入认知 Patch。
+
+Patch 是 JSON 对象，至少包含 `type`、`scope`、`correction`、`trigger_conditions`、`status`、`metrics` 和来源 run。状态转换为：
+
+- `strategy`、`action_chain`、`knowledge_experience`：`draft -> shadow -> active -> expired`，达到灰度阈值后可自动激活。
+- `policy`：`draft -> review_required -> active -> expired`，绝不自动升级；只能调用 `agent.approve_cognitive_patch(patch_id)` 完成人工批准。
+- `knowledge_definition`：CodeY 采用更保守的仓库级取舍，也进入 `review_required`，避免仅凭文件名自动改写架构边界。
+
+`shadow` 不是被动计数：同 scope 的候选按稳定哈希进入少量任务 prompt，并标记为 shadow guidance；只有本次 trace 实际触发 Patch 声明的目标工具或路径才计为 hit，无关任务的成功不会抬高成功率。默认参数为 20% 灰度流量、至少 3 次命中、命中率不低于 10%、成功率不低于 80% 才激活；累计 100 次命中后成功率低于 40% 会过期，任何 `harmful` 灰度结果会立即过期。激活后仍持续统计，后续退化也会触发过期；过期 Patch 保留 JSON 审计记录，但会从 active 知识视图移除。
+
+激活 Patch 的知识视图按类型路由：Policy 写入 `behavior/policies.md`，Strategy/Action Chain 写入 `decisions.md`，定义与经验分别写入 `knowledge/definition/` 和 `knowledge/experience/`。这些路径都位于 workspace 的 `.codey/evolution/` 下，Patch JSON 是审计事实源。Python API 可通过 `evolution_thresholds={...}` 覆盖阈值，或用 `feature_flags={"self_evolution": False}` 关闭闭环。
 
 ## Provider 支持
 

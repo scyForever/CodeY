@@ -4,7 +4,7 @@
 这个对象会被不断写入 task_state.json，供运行中观察和运行后复盘。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import uuid4
 
@@ -41,6 +41,7 @@ class TaskState:
     route_id: str = ""
     route_fallback: bool = False
     route_match_terms: tuple[str, ...] = ()
+    evolution_context: dict = field(default_factory=dict)
 
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
@@ -66,6 +67,7 @@ class TaskState:
             route_id=str(data.get("route_id", "")),
             route_fallback=bool(data.get("route_fallback", False)),
             route_match_terms=tuple(str(item) for item in data.get("route_match_terms", [])),
+            evolution_context=dict(data.get("evolution_context", {}) or {}),
         )
 
     def record_attempt(self):
@@ -119,4 +121,5 @@ class TaskState:
             "route_id": self.route_id,
             "route_fallback": self.route_fallback,
             "route_match_terms": list(self.route_match_terms),
+            "evolution_context": dict(self.evolution_context),
         }
