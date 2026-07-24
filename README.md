@@ -379,7 +379,9 @@ Patch 是 JSON 对象，至少包含 `type`、`scope`、`correction`、`trigger_
 - `CodeY/evaluation/evaluator.py`：固定 benchmark、fixture、verifier、预算和停止原因检查。
 - `CodeY/evaluation/metrics.py`：记忆/上下文/安全/恢复实验与报告渲染。
 - `CodeY/evaluation/real_skill_routing.py`：真实外部模型的多 Skill 选择、解析和计分。
+- `CodeY/evaluation/long_context_dialogue.py`：从本机 Codex rollout 构建去标识化长对话数据，并进行配对 replay。
 - `scripts/run_real_skill_routing_experiment.py`：运行 5/15/25/50/100 Skill 对照实验。
+- `scripts/run_long_context_dialogue_experiment.py`：运行完整对话、真实压缩摘要、尾窗、结构化 ledger 与 oracle 对照。
 - `scripts/run_provider_experiments.py`：provider 实验。
 - `scripts/collect_resume_metrics.py`：聚合 benchmark 与 run artifacts。
 - `scripts/run_large_scale_experiments.py`：生成完整实验产物。
@@ -416,6 +418,28 @@ python scripts/run_real_skill_routing_experiment.py --provider anthropic
 - `artifacts/real-skill-routing/skills/*/SKILL.md`：由固定目录物化出的 100 个可解析 Skill 文件。
 
 核心指标包括 exact set match、固定 anchor accuracy、单 Skill accuracy、多 Skill exact match、拒识 accuracy、micro precision/recall/F1、误触发数、漏召回数、prompt 字符数和调用延迟。外部模型调用不进入默认 pytest；测试只使用固定 JSON 验证数据、提示词、解析器和计分逻辑。
+
+### 真实多轮对话长上下文评测
+
+长上下文评测读取本机 `.codex/sessions` 中人工选定的 rollout，但不会把原始路径、reasoning、工具输出、图片或加密内容写入数据集。可见用户/助手消息和人工标注字段会经过路径、账户、网络地址、凭据等规则清洗，`redact_terms` 中的人工专名替换会跨全部 case 应用，结果也不会记录 provider endpoint。自动清洗不能可靠识别人名或私有项目名，因此数据仅供本地评测，发布前仍需人工隐私审查。来源映射 `selection.local.json` 含本机定位信息，只能留在本地；它与去标识化数据集、结果默认写入已被 Git 忽略的 `artifacts/long-context-dialogue/`。
+
+每个 probe 固定同一段历史和同一问题，只改变上下文表示：
+
+- `full_dialogue`：完整的去标识化可见对话；
+- `codex_summary`：最近一次 Codex 压缩摘要与压缩后的可见消息；
+- `tail_window`：按相同字符预算保留的连续完整尾部消息；
+- `structured_ledger`：人工标注的事件/约束 ledger，上界型结构化记忆基线；
+- `oracle`：最小充分证据，用于能力门控，不计入压缩收益。
+
+```bash
+# 只构建和检查去标识化数据，不调用外部模型
+python scripts/run_long_context_dialogue_experiment.py --build-only
+
+# 使用 .env 中配置的 provider/model 运行全部配对分支
+python scripts/run_long_context_dialogue_experiment.py
+```
+
+结果同时报告远距事实回答、当前约束集合、过期约束误选和按 oracle 门控后的压缩敏感案例。格式计分要求输出仅包含一个 JSON 对象且字段严格匹配；最终格式准确率、首次生成格式准确率、解析重试和 provider 传输重试分开统计，最终解析失败仍保留为错误行。未运行的 oracle 标为 incomplete，不会误算为能力失败；显式运行无 oracle 子集时则报告 ungated 原始指标。`dataset_sha256` 是移除其自引用字段后的 canonical JSON 哈希，不等于磁盘文件整体哈希。该实验评测的是外显上下文利用行为，不把结果表述为模型内部 attention 权重。
 
 其他实验脚本仍需要相应 benchmark、fixture、run root 和输出路径。
 
