@@ -39,7 +39,7 @@ WELCOME_ART = (
     "      /|       |\\\\",
 )
 WELCOME_NAME = "codey"
-WELCOME_SUBTITLE = "local coding agent"
+WELCOME_SUBTITLE = "repository rule steward + local agent"
 WELCOME_STATUS = "calm shell, ready for work"
 HELP_DETAILS = textwrap.dedent(
     """\
@@ -280,7 +280,8 @@ def build_agent(args):
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="Minimal coding agent for DeepSeek, OpenAI-compatible, Anthropic-compatible, or Ollama models.",
+        description="Repository rule-governance helper with an optional local coding-agent runtime.",
+        epilog="Use `codey rules --help` for rule scanning, patch review, isolated trials, and delegation.",
     )
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
@@ -334,8 +335,35 @@ def build_arg_parser():
     return parser
 
 
+def _rules_command_argv(raw_argv):
+    if raw_argv[:1] == ["rules"]:
+        return raw_argv[1:]
+    forwarded = []
+    index = 0
+    while index < len(raw_argv):
+        token = raw_argv[index]
+        if token == "--cwd" and index + 1 < len(raw_argv):
+            forwarded.extend((token, raw_argv[index + 1]))
+            index += 2
+            continue
+        if token.startswith("--cwd="):
+            forwarded.append(token)
+            index += 1
+            continue
+        break
+    if index < len(raw_argv) and raw_argv[index] == "rules":
+        return forwarded + raw_argv[index + 1 :]
+    return None
+
+
 def main(argv=None):
-    args = build_arg_parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    rules_argv = _rules_command_argv(raw_argv)
+    if rules_argv is not None:
+        from .rules.cli import main as rules_main
+
+        return rules_main(rules_argv)
+    args = build_arg_parser().parse_args(raw_argv)
     agent = build_agent(args)
 
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL))

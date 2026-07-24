@@ -1,21 +1,21 @@
 {
-  "name": "skill-based-architecture",
-  "description": "Restructure oversized SKILL.md or scattered project rules into a well-organized Skill directory, with cross-tool thin shells, SessionStart hooks, Task Closure Protocol, and self-evolving workflows.",
+  "name": "codey-rule-governance",
+  "description": "Scan distributed coding-agent rules, create reviewable patches, and run isolated CodeY, Codex, or Claude trials.",
   "author": {
     "name": "WoJiSama"
   },
   "license": "MIT",
   "keywords": [
-    "skill",
-    "architecture",
+    "codey",
+    "governance",
     "rules",
     "documentation",
-    "meta-skill",
+    "canary",
     "cross-tool",
     "claude-code",
     "cursor",
     "codex",
     "gemini"
   ],
-  "skills": ["./"]
+  "skills": ["./skills/codey"]
 }

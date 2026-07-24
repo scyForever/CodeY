@@ -1,7 +1,7 @@
 ---
 name: codey
-description: Maintain and extend the CodeY local coding-agent runtime, including prompts, tools, providers, sessions, evaluation, packaging, skills, and hooks.
-triggers: ["CodeY", "coding agent", "本地编码 Agent", "技能路由"]
+description: Maintain CodeY repository-rule governance, isolated cross-agent trials, and the optional local coding-agent runtime.
+triggers: ["CodeY", "rule governance", "AGENTS.md", "CLAUDE.md", "Codex", "Claude", "规则治理", "灰度测试"]
 ---
 
 <always-applicable>
@@ -18,6 +18,13 @@ Match every new task independently. Read only the selected route's workflow and 
 ```json
 {
   "tasks": [
+    {
+      "id": "rule-governance",
+      "label": "Repository rules and agent trials / 仓库规则与 Agent 灰度",
+      "triggers": ["rule", "AGENTS.md", "CLAUDE.md", "Cursor", "Codex", "Claude", "canary", "规则", "灰度", "交付"],
+      "workflow": "workflows/change-rules.md",
+      "reads": ["rules/rule-governance.md"]
+    },
     {
       "id": "prompt-context",
       "label": "Prompt and context runtime / 提示词与上下文",

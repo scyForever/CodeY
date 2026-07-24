@@ -1,26 +1,26 @@
 {
-  "name": "skill-based-architecture",
-  "id": "skill-based-architecture",
+  "name": "codey-rule-governance",
+  "id": "codey-rule-governance",
   "owner": {
     "name": "WoJiSama"
   },
   "metadata": {
-    "description": "Turn scattered project rules and oversized SKILL.md files into a maintainable skill-based architecture."
+    "description": "Govern distributed repository rules and trial them across local coding agents."
   },
   "plugins": [
     {
-      "name": "skill-based-architecture",
+      "name": "codey-rule-governance",
       "source": "./",
-      "description": "Restructure oversized SKILL.md or scattered project rules into a well-organized Skill directory, with cross-tool thin shells, SessionStart hooks, Task Closure Protocol, and self-evolving workflows.",
+      "description": "Scan distributed coding-agent rules, create reviewable patches, and run isolated CodeY, Codex, or Claude trials.",
       "author": {
         "name": "WoJiSama"
       },
       "keywords": [
-        "skill",
-        "architecture",
+        "codey",
+        "governance",
         "rules",
         "documentation",
-        "meta-skill",
+        "canary",
         "cross-tool"
       ],
       "category": "workflow"

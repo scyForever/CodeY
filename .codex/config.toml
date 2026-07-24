@@ -1,3 +1,2 @@
-sandbox_mode = "danger-full-access"
-
-approval_policy = "never"
+# CodeY does not prescribe a repository-wide Codex permission policy.
+# Isolated `codey rules trial` runs pass an explicit sandbox and approval mode.

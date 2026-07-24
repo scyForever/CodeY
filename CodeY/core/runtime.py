@@ -247,6 +247,25 @@ class CodeYAgent:
     def route_context_text(self):
         return self.current_route.route_context
 
+    def rule_context_text(self):
+        """Load only the explicitly reviewed local CodeY rule artifact."""
+        path = self.root / ".codey" / "rules" / "active.md"
+        if not path.exists():
+            return "Reviewed repository rule patch:\n- none"
+        try:
+            from ..rules.patches import RulePatchStore
+
+            artifact = RulePatchStore(self.root).active_artifact("codey")
+        except (OSError, UnicodeDecodeError, ValueError):
+            return "Reviewed repository rule patch:\n- unavailable"
+        if artifact is None:
+            return "Reviewed repository rule patch:\n- unavailable"
+        return (
+            "Reviewed repository rule patch:\n"
+            f"Patch: {artifact['patch_id']}\n"
+            + artifact["content"].strip()
+        )
+
     def route_status(self):
         return self.skill_router.status(self.current_route)
 
@@ -275,7 +294,7 @@ class CodeYAgent:
 
         # 工作区事实相对稳定，所以这里按整体刷新；
         # 只有这些事实真的变化了，才重建完整 prefix。
-        refreshed_workspace = WorkspaceContext.build(self.root)
+        refreshed_workspace = WorkspaceContext.build(self.workspace.cwd, repo_root_override=self.root)
         refreshed_workspace_fingerprint = refreshed_workspace.fingerprint()
         workspace_changed = force or refreshed_workspace_fingerprint != previous_workspace_fingerprint
         if workspace_changed:

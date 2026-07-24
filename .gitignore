@@ -43,6 +43,7 @@ readme_intro_locked/
 # Local docs not intended for publication
 docs/*
 !docs/evolution-hybrid-risk-register.md
+!docs/rule-governance.md
 
 # OS files
 .DS_Store

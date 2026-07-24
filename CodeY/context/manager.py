@@ -13,6 +13,7 @@ from dataclasses import dataclass
 DEFAULT_TOTAL_BUDGET = 12000
 DEFAULT_SECTION_BUDGETS = {
     "prefix": 3600,
+    "rule_context": 2400,
     "route_context": 2200,
     "memory": 1600,
     "relevant_memory": 1200,
@@ -20,14 +21,30 @@ DEFAULT_SECTION_BUDGETS = {
 }
 DEFAULT_SECTION_FLOORS = {
     "prefix": 1200,
+    "rule_context": 600,
     "route_context": 500,
     "memory": 400,
     "relevant_memory": 300,
     "history": 1500,
 }
 # 当 prompt 超预算时，会优先压缩旧记忆和历史，最后才动当前任务路由与稳定前缀。
-DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "memory", "route_context", "prefix")
-SECTION_ORDER = ("prefix", "route_context", "memory", "relevant_memory", "history", "current_request")
+DEFAULT_REDUCTION_ORDER = (
+    "relevant_memory",
+    "history",
+    "memory",
+    "route_context",
+    "rule_context",
+    "prefix",
+)
+SECTION_ORDER = (
+    "prefix",
+    "rule_context",
+    "route_context",
+    "memory",
+    "relevant_memory",
+    "history",
+    "current_request",
+)
 CURRENT_REQUEST_SECTION = "current_request"
 RELEVANT_MEMORY_LIMIT = 3
 
@@ -109,6 +126,9 @@ class ContextManager:
             context_reduction_enabled = self.agent.feature_enabled("context_reduction")
         section_texts = {
             "prefix": str(getattr(self.agent, "prefix", "")),
+            "rule_context": str(self.agent.rule_context_text())
+            if hasattr(self.agent, "rule_context_text")
+            else "Reviewed repository rule patch:\n- none",
             "route_context": str(getattr(getattr(self.agent, "current_route", None), "route_context", "")) or "Selected task route:\n- none",
             "memory": "Memory:\n- disabled" if not memory_enabled else str(self.agent.memory_text()),
             "history": "",
@@ -196,6 +216,7 @@ class ContextManager:
         history_raw = self._raw_history_text(history)
         return {
             "prefix": SectionRender(raw=section_texts["prefix"], budget=len(section_texts["prefix"]), rendered=section_texts["prefix"], details={}),
+            "rule_context": SectionRender(raw=section_texts["rule_context"], budget=len(section_texts["rule_context"]), rendered=section_texts["rule_context"], details={}),
             "route_context": SectionRender(raw=section_texts["route_context"], budget=len(section_texts["route_context"]), rendered=section_texts["route_context"], details={}),
             "memory": SectionRender(raw=section_texts["memory"], budget=len(section_texts["memory"]), rendered=section_texts["memory"], details={}),
             "relevant_memory": SectionRender(
@@ -449,12 +470,8 @@ class ContextManager:
         # 顺序是刻意设计的：稳定规则放前面，最新请求放最后。
         return "\n\n".join(
             [
-                rendered["prefix"].rendered,
-                rendered["route_context"].rendered,
-                rendered["memory"].rendered,
-                rendered["relevant_memory"].rendered,
-                rendered["history"].rendered,
-                rendered[CURRENT_REQUEST_SECTION].rendered,
+                rendered[section].rendered
+                for section in SECTION_ORDER
             ]
         ).strip()
 
@@ -471,6 +488,13 @@ class ContextManager:
             "budget_chars": None,
             "rendered_chars": len(rendered[CURRENT_REQUEST_SECTION].rendered),
         }
+        rule_context = rendered["rule_context"].raw.strip()
+        if rule_context == "Reviewed repository rule patch:\n- none":
+            rule_state = "none"
+        elif rule_context == "Reviewed repository rule patch:\n- unavailable":
+            rule_state = "unavailable"
+        else:
+            rule_state = "active"
         return {
             "prompt_chars": len(prompt),
             "prompt_budget_chars": self.total_budget,
@@ -501,6 +525,12 @@ class ContextManager:
                 **(self.agent.current_route.to_dict() if getattr(self.agent, "current_route", None) else {}),
                 "raw_chars": rendered["route_context"].raw_chars,
                 "rendered_chars": rendered["route_context"].rendered_chars,
+            },
+            "rules": {
+                "raw_chars": rendered["rule_context"].raw_chars,
+                "rendered_chars": rendered["rule_context"].rendered_chars,
+                "loaded": rule_state == "active",
+                "state": rule_state,
             },
             "history": {
                 "raw_chars": rendered["history"].raw_chars,

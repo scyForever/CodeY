@@ -1,12 +1,17 @@
 # CodeY
 
-CodeY 是一个面向本地代码仓库的小型 Coding Agent Runtime。它将模型调用、工具执行、上下文预算、会话恢复、结构化 Skill 路由和运行审计组合在一个可读、可测试的 Python 控制循环中。
+CodeY 是一个面向本地代码仓库的 **Coding Agent 规则治理与灰度辅助工具**。它读取分散的 `AGENTS.md`、`CLAUDE.md`、Cursor/Codex 规则与 Skills，整理为可审查的 Rule Patch，并在不污染当前工作树的前提下交给内置 CodeY、已有 Codex 或 Claude 做灰度试验。内置 Coding Agent Runtime 仍然保留，但它是可选执行后端，不是项目要替代 Codex/Claude Code 的理由。
 
-> 项目仍处于开发阶段。当前 provider 层以 Ollama、OpenAI-compatible、Anthropic-compatible 和 DeepSeek-compatible HTTP 适配器为主；“兼容”不代表已经接入对应厂商 SDK 的全部原生能力。
+> 项目仍处于开发阶段。跨 Agent 适配只承诺这里明确探测和测试过的 CLI 能力；不同工具对规则继承、hook、sandbox 和结构化输出的支持并不等价。
 
 ## 核心能力
 
-- **受控 Agent 循环**：模型每轮只能返回一个 `<tool>` 或 `<final>`，Runtime 负责解析、校验、执行和停止。
+- **分散规则发现**：扫描层级化 `AGENTS.md` / `CLAUDE.md`、Cursor rules/skills、Claude rules/skills 与 Codex 配置，记录生态、scope、revision、真实路径和内容哈希。
+- **可审查 Rule Patch**：生成 CodeY、Codex、Claude、Cursor 四类适配产物，保留来源与目标 diff；Patch 只进入 `review_required`，不会因模型判断自动激活。
+- **隔离灰度**：`trial` 在 detached worktree 中做只读候选/基线/canary 试验；Codex 使用显式 sandbox，Claude 禁用仓库 hook 与 Bash，任何 Git 可见的 inspect 写入都判失败。
+- **有限任务交付**：`delegate` 可让本机 Codex/Claude 在隔离 worktree 中修改代码，只返回受文件数、diff 行数和字节数约束的补丁，不直接改当前工作树。
+- **精确发布与回滚**：apply/rollback 必须显式批准，在跨进程锁内重新校验 source/target hash，并用冲突感知事务日志恢复中断操作；CodeY 不改用户全局配置，也不放宽外部 Agent 权限模型。
+- **可选受控 Agent 循环**：原有 CodeY Runtime 仍支持 `<tool>` / `<final>` 控制循环，用于少量仓库内修改与独立评测。
 - **结构化 Skill 管理**：先进行领域 Skill 粗路由，再按 `SKILL.md` 的 Tasks 表选择任务路由。
 - **渐进式按需加载**：SessionStart 只加载 Skill 导航和 Always-read 核心约束；只有命中的任务才读取 workflow 和 route-specific 文件。
 - **XML 核心边界**：`<always-applicable>` 与 `<task-routing>` 将核心约束和路由协议分开，便于压缩后重新注入。
@@ -20,21 +25,26 @@ CodeY 是一个面向本地代码仓库的小型 Coding Agent Runtime。它将�
 ## 架构
 
 ```text
-CLI
- ├─ WorkspaceContext
- ├─ Provider Client
- ├─ SkillRouter ── 双层路由 + 渐进加载
- └─ SessionStart HookManager
+Repository rule sources (untrusted)
           │
           ▼
-      CodeYAgent
-       ├─ PromptPrefix（稳定规则、工具、Skill core）
-       ├─ ContextManager（route、memory、history、request）
-       ├─ AgentLoop
-       │    ├─ ModelClient
-       │    ├─ ToolExecutor
-       │    └─ CognitiveLoop（trace、outcome、root cause、patch gate）
-       └─ Session / Checkpoint / Run / Memory stores
+ RuleScanner ── scope / revision / hash / config diagnostics
+          │
+          ▼
+ RulePatchStore ── review_required ── exact apply / rollback
+          │
+          ├─ CodeY adapter  ── reviewed rule context
+          ├─ Codex adapter  ── AGENTS.md
+          ├─ Claude adapter ── CLAUDE.md
+          └─ Cursor adapter ── .cursor/rules/*.mdc
+                    │
+                    ▼
+       Detached worktree trial / delegate
+       (CodeY | local Codex | local Claude)
+
+Optional execution backend:
+CLI -> WorkspaceContext / SkillRouter / Provider -> CodeYAgent
+    -> ContextManager -> AgentLoop / ToolExecutor / CognitiveLoop
 ```
 
 主要目录：
@@ -48,6 +58,7 @@ CodeY/
 ├─ storage/       # Session、Checkpoint、Run artifacts
 ├─ memory/        # 工作记忆与 durable memory
 ├─ evolution/     # 规则监督的任务后认知闭环与 Patch 状态机
+├─ rules/         # 仓库规则发现、Rule Patch、跨 Agent 适配与隔离 runner
 ├─ providers/     # 模型后端适配器
 └─ evaluation/    # 固定评测与指标实验
 skills/codey/     # 当前仓库自身的示例/维护 Skill
@@ -188,13 +199,43 @@ Copy-Item .env.example .env
 
 ## 使用
 
-### 单次任务
+### 仓库规则治理主流程
+
+```bash
+# 1. 只读盘点分散规则、配置和风险
+codey rules --cwd . scan
+
+# 2. 生成四种目标适配的 review_required Patch
+codey rules --cwd . plan
+codey rules --cwd . status <rule-patch-id> --json
+codey rules --cwd . diff <rule-patch-id>
+
+# 3. 查看本机可用 runner，并做候选或稳定 canary 分流
+codey rules --cwd . agents
+codey rules --cwd . trial <rule-patch-id> --runner codex --variant candidate "检查入口与测试约束，不要修改文件"
+codey rules --cwd . trial <rule-patch-id> --runner claude --variant canary --cohort-key task-42 "检查入口与测试约束，不要修改文件"
+
+# 4. 显式批准发布；目标漂移时会拒绝
+codey rules --cwd . apply <rule-patch-id> --approve
+codey rules --cwd . rollback <rule-patch-id> --approve
+```
+
+需要把较大的修改交给已有工具时，用 `delegate`。它只在隔离 worktree 中运行，成功后把 `changes.patch` 留在 `.codey/rules/trials/<trial-id>/`：
+
+```bash
+codey rules --cwd . delegate <rule-patch-id> --runner codex "实现指定修改并运行相关测试"
+codey rules --cwd . delegate <rule-patch-id> --runner claude "实现指定的受限文件修改，并说明验证建议"
+```
+
+`scan` 会读取仓库文本，但不会执行 hook；`plan` 会拒绝越界路径、非 UTF-8、超限文件和 secret-shaped 内容。`status --json` 暴露 source path/scope/hash、revision、dirty 路径和目标 before/candidate hash，供审批时核对。生成块保留每个来源的 scope，不能把嵌套目录规则无条件解释为全仓规则。完整契约和残余风险见 [规则治理与隔离试验](docs/rule-governance.md)。
+
+### 可选内置 Agent：单次任务
 
 ```bash
 codey --cwd . --provider deepseek "解释这个仓库的入口"
 ```
 
-### 交互模式
+### 可选内置 Agent：交互模式
 
 ```bash
 codey --cwd .
@@ -257,21 +298,22 @@ codey --approval never # 拒绝危险操作
 - `write_file`、`patch_file`、`run_shell` 等风险动作遵守审批策略。
 - `patch_file` 要求旧文本唯一匹配。
 - 连续重复且无进展的工具调用会被拒绝。
-- delegate 是步数受限的只读子 Agent，不能批准风险动作。
+- Runtime 内置工具 `delegate` 是步数受限的只读子 Agent，不能批准风险动作；它不同于会在隔离 worktree 中编辑的 `codey rules delegate`。
 - shell 只继承 allowlist 环境；trace/report 做 secret redaction。
 
-模型输出仍属于不可信输入。若把 CodeY 用于不可信仓库或高风险执行环境，应额外使用容器、受限系统用户和网络隔离。
+模型输出和仓库规则仍属于不可信输入。本机 Codex/Claude 为联网调用仍会访问各自的认证配置；若把 CodeY 用于高度不可信仓库或高风险执行环境，应使用一次性工具 profile，并额外采用容器、受限系统用户和网络隔离。
 
 ## Prompt 与上下文管理
 
 最终 prompt 的顺序是：
 
 1. 稳定 prefix：Runtime 规则、工具协议、Skill core、workspace 基线
-2. route context：当前任务 workflow 与按需读取文件
-3. working memory
-4. relevant memory
-5. 压缩后的 transcript
-6. 当前用户请求
+2. reviewed rule context：显式应用或试验中的 CodeY Rule Patch
+3. route context：当前任务 workflow 与按需读取文件
+4. working memory
+5. relevant memory
+6. 压缩后的 transcript
+7. 当前用户请求
 
 超预算时优先压缩相关记忆和旧历史，再压缩 working memory、route context 与 prefix。当前请求永不裁剪。每轮 metadata 记录 section 大小、压缩步骤、prefix/workspace/tool/skill fingerprint 和路由加载证据。
 
@@ -289,15 +331,20 @@ codey --approval never # 拒绝危险操作
 │  ├─ trace.jsonl
 │  └─ report.json
 ├─ memory/
-   ├─ MEMORY.md
-   └─ topics/*.md
-└─ evolution/
-   ├─ patches/patch_*.json
-   ├─ behavior/policies.md
-   ├─ decisions.md
-   └─ knowledge/
-      ├─ definition/*.md
-      └─ experience/*.md
+│  ├─ MEMORY.md
+│  └─ topics/*.md
+├─ evolution/
+│  ├─ patches/patch_*.json
+│  ├─ behavior/policies.md
+│  ├─ decisions.md
+│  └─ knowledge/
+│     ├─ definition/*.md
+│     └─ experience/*.md
+├─ rules/
+│  ├─ patches/rulepatch_*.json
+│  └─ trials/<trial-id>/
+│     ├─ result.json
+│     └─ changes.patch
 ```
 
 - **session**：可恢复的历史、memory、checkpoint 和 session context。
@@ -306,7 +353,9 @@ codey --approval never # 拒绝危险操作
 - **report**：一次运行的结果与关键 metadata。
 - **checkpoint**：用于新鲜度、工作区不匹配和压缩后的恢复。
 
-## 规则监督的自进化认知闭环
+## 可选 Runtime 的规则监督认知闭环
+
+这一节描述的是内置 CodeY Runtime 的任务后认知 Patch，**不是**跨 Codex/Claude 的 Rule Patch 灰度。两者 schema、证据、状态机和存储相互独立；一次外部 candidate 成功也不能作为认知 Patch 自动激活或因果改进证明。
 
 每个顶层 `ask()` 终结后都会执行一条确定性链路：
 
