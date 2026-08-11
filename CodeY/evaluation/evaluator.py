@@ -87,7 +87,7 @@ SCRIPTED_MODEL_OUTPUTS = {
         '<tool name="patch_file" path="sample.txt"><old_text>placeholder</old_text><new_text>repeat-guarded</new_text></tool>',
         "<final>Done.</final>",
     ],
-    "context_reduction_checkpoint": [
+    "context_budget_checkpoint": [
         "<final>Done.</final>",
     ],
     "freshness_reanchor_resume": [
@@ -305,16 +305,26 @@ def _apply_task_setup(agent, task, fixture_copy_root):
         return
 
     kind = str(setup.get("kind", "")).strip()
-    if kind == "context_reduction":
-        history_count = int(setup.get("history_count", 12))
+    if kind == "context_budget":
+        turn_count = int(setup.get("turn_count", 12))
         note_count = int(setup.get("note_count", 6))
-        for index in range(history_count):
-            agent.record(
+        for index in range(turn_count):
+            turn_id = f"benchmark-turn-{index:04d}"
+            agent.record_transcript(
                 {
-                    "role": "user" if index % 2 == 0 else "assistant",
+                    "role": "user",
                     "content": f"benchmark-history-{index}-" + ("A" * 220),
                     "created_at": f"2026-04-15T09:{index:02d}:00+00:00",
-                }
+                },
+                turn_id=turn_id,
+            )
+            agent.record_transcript(
+                {
+                    "role": "assistant",
+                    "content": f"benchmark-response-{index}-" + ("A" * 120),
+                    "created_at": f"2026-04-15T09:{index:02d}:30+00:00",
+                },
+                turn_id=turn_id,
             )
         for index in range(note_count):
             agent.memory.append_note(
@@ -322,14 +332,24 @@ def _apply_task_setup(agent, task, fixture_copy_root):
                 tags=("recall",),
                 created_at=f"2026-04-15T10:{index:02d}:00+00:00",
             )
-        agent.session["memory"] = agent.memory.to_dict()
         agent.context_manager.total_budget = int(setup.get("total_budget", 900))
-        agent.context_manager.section_budgets = dict(
-            setup.get(
-                "section_budgets",
-                {"prefix": 120, "memory": 120, "relevant_memory": 120, "history": 160},
+        section_budgets = dict(agent.context_manager.section_budgets)
+        section_budgets.update(
+            dict(
+                setup.get(
+                    "section_budgets",
+                    {
+                        "prefix": 120,
+                        "checkpoint": 120,
+                        "memory": 120,
+                        "relevant_memory": 120,
+                        "conversation_summary": 120,
+                        "transcript": 160,
+                    },
+                )
             )
         )
+        agent.context_manager.section_budgets = section_budgets
         return
 
     if kind == "freshness_mismatch":
@@ -338,7 +358,6 @@ def _apply_task_setup(agent, task, fixture_copy_root):
         agent.memory.set_file_summary(path, summary_text)
         agent.memory.remember_file(path)
         freshness = agent.memory.to_dict()["file_summaries"][path]["freshness"]
-        agent.session["memory"] = agent.memory.to_dict()
         agent.session["checkpoints"] = {
             "current_id": "ckpt_freshness",
             "items": {
@@ -353,7 +372,7 @@ def _apply_task_setup(agent, task, fixture_copy_root):
                 )
             },
         }
-        agent.session_store.save(agent.session)
+        agent.save_session()
         (fixture_copy_root / path).write_text(str(setup.get("mutated_text", "alpha\nbeta\nstale-updated\nplaceholder\n")), encoding="utf-8")
         return
 
@@ -370,7 +389,7 @@ def _apply_task_setup(agent, task, fixture_copy_root):
                 )
             },
         }
-        agent.session_store.save(agent.session)
+        agent.save_session()
         return
 
 
@@ -472,7 +491,7 @@ class BenchmarkEvaluator:
         )
         _apply_task_setup(agent, task, fixture_copy_root)
 
-        initial_history_empty = len(agent.session["history"]) == 0
+        initial_transcript_empty = not agent.transcript_entries()
         initial_memory_state = agent.memory.to_dict()
         initial_memory_empty = memorylib.is_effectively_empty(initial_memory_state)
         initial_task_summary_empty = not str(initial_memory_state["working"]["task_summary"]).strip()
@@ -540,7 +559,7 @@ class BenchmarkEvaluator:
             "attempts": task_state.attempts,
             "final_answer": final_answer,
             "stop_reason": task_state.stop_reason,
-            "initial_history_empty": initial_history_empty,
+            "initial_transcript_empty": initial_transcript_empty,
             "initial_memory_empty": initial_memory_empty,
             "initial_task_summary_empty": initial_task_summary_empty,
             "initial_episodic_notes_empty": initial_episodic_notes_empty,

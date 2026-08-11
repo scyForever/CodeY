@@ -14,6 +14,7 @@ from pathlib import Path
 from ..config import load_project_env, provider_env
 from ..providers.clients import (
     AnthropicCompatibleModelClient,
+    ModelCompletion,
     OpenAICompatibleModelClient,
 )
 
@@ -22,6 +23,9 @@ SCHEMA_VERSION = 1
 DEFAULT_SCALES = (5, 15, 25, 50, 100)
 MODES = ("flat_full", "structured_index")
 QUOTED_TRIGGER_RE = re.compile(r'"([^"\r\n]+)"')
+DESCRIPTION_NEAR_MISS_RE = re.compile(
+    r"It should not activate for (?P<first>[^,]+), (?P<second>[^,]+), or (?P<third>[^.]+)\.\s*$"
+)
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 ENGLISH_WORD_RE = re.compile(r"[A-Za-z]+(?:[-'][A-Za-z]+)*")
 WORKFLOW_ENUMERATION_RE = re.compile(
@@ -137,14 +141,21 @@ def _description_rule_violations(skill):
                 violations.append(f"trigger phrase is too generic: {phrase}")
             if any(separator in phrase for separator in (",", "，", "、", "/")):
                 violations.append(f"trigger phrase looks like a keyword list: {phrase}")
+        if len({_normalized_trigger_phrase(phrase) for phrase in phrases}) != 2:
+            violations.append("quoted trigger phrases must be unique")
 
-    near_miss = re.search(r"It should not activate for (.+?)\.$", description)
+    near_miss = DESCRIPTION_NEAR_MISS_RE.search(description)
     if not near_miss:
         violations.append("must end with three near-miss non-activation examples")
     else:
-        boundary = near_miss.group(1)
-        if boundary.count(",") < 2 or ", or " not in boundary:
+        values = tuple(near_miss.group(name).strip() for name in ("first", "second", "third"))
+        if any(not value for value in values) or len({_normalized_trigger_phrase(value) for value in values}) != 3:
             violations.append("near-miss boundary must name three distinct examples")
+        if {
+            _normalized_trigger_phrase(value)
+            for value in values
+        } & {_normalized_trigger_phrase(phrase) for phrase in phrases}:
+            violations.append("near-miss examples must not repeat trigger phrases")
     if WORKFLOW_ENUMERATION_RE.search(description):
         violations.append("must not enumerate workflow steps")
     return phrases, violations
@@ -346,13 +357,11 @@ def render_flat_catalog(dataset, scale):
 def render_skill_document(dataset, skill):
     """Render a benchmark Skill in the same shape as a project SKILL.md."""
     category = _category_map(dataset)[skill.category]
-    triggers = json.dumps(list(skill.capabilities), ensure_ascii=False)
     responsibilities = "\n".join(f"- {item}" for item in skill.capabilities)
     return (
         "---\n"
         f"name: {skill.id}\n"
         f"description: {skill.description}\n"
-        f"triggers: {triggers}\n"
         "---\n\n"
         "<always-applicable>\n"
         f"Domain: {category.label}\n"
@@ -562,7 +571,7 @@ def score_predictions(cases, predictions, active_skill_ids):
     }
 
 
-def _external_provider_profile(workspace_root, provider=None):
+def _external_provider_profile(workspace_root, provider=None, model_override=None):
     load_project_env(workspace_root)
     provider = str(provider or provider_env("CODEY_PROVIDER", default="")).strip().lower()
     if provider not in {"openai", "anthropic", "deepseek"}:
@@ -616,8 +625,12 @@ def _external_provider_profile(workspace_root, provider=None):
             "https://api.deepseek.com/anthropic",
         )
         client_type = "anthropic"
+    if model_override:
+        model = str(model_override).strip()
     if not api_key:
         raise RealSkillEvaluationError(f"{provider} API key is not configured in .env")
+    if not model:
+        raise RealSkillEvaluationError(f"{provider} model is not configured")
     return {
         "provider": provider,
         "model": model,
@@ -628,9 +641,17 @@ def _external_provider_profile(workspace_root, provider=None):
 
 
 def build_external_model_client(
-    workspace_root, provider=None, timeout=300, transport_attempts=1
+    workspace_root,
+    provider=None,
+    model_override=None,
+    timeout=300,
+    transport_attempts=1,
 ):
-    profile = _external_provider_profile(workspace_root, provider=provider)
+    profile = _external_provider_profile(
+        workspace_root,
+        provider=provider,
+        model_override=model_override,
+    )
     if profile["client_type"] == "openai":
         client = OpenAICompatibleModelClient(
             model=profile["model"],
@@ -658,9 +679,12 @@ def run_model_batch(client, prompt, cases, max_output_tokens=8192, parse_retries
     current_prompt = prompt
     for attempt in range(parse_retries + 1):
         started = time.perf_counter()
-        response = client.complete(current_prompt, max_new_tokens=max_output_tokens)
+        completion = client.complete(current_prompt, max_new_tokens=max_output_tokens)
+        if not isinstance(completion, ModelCompletion):
+            raise TypeError("routing evaluation clients must return ModelCompletion")
+        response = completion.text
         elapsed = time.perf_counter() - started
-        metadata = dict(getattr(client, "last_completion_metadata", {}) or {})
+        metadata = dict(completion.metadata)
         record = {
             "attempt": attempt + 1,
             "elapsed_seconds": elapsed,

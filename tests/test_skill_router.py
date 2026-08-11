@@ -20,8 +20,8 @@ def test_routes_english_and_chinese_without_loading_other_routes(tmp_path):
     copy_skill(tmp_path)
     router = SkillRouter(tmp_path)
 
-    prompt_route = router.route("Fix the prompt context budget")
-    tool_route = router.route("加强工具安全和审批")
+    prompt_route = router.route("CodeY agent runtime engineering: Fix the prompt context budget")
+    tool_route = router.route("local coding assistant harness: 加强工具安全和审批")
 
     assert prompt_route.route_id == "prompt-context"
     assert "rules/prompt-context.md" in prompt_route.loaded_paths
@@ -30,12 +30,16 @@ def test_routes_english_and_chinese_without_loading_other_routes(tmp_path):
     assert "rules/tools-security.md" in tool_route.loaded_paths
 
 
-def test_falls_back_to_other_and_supports_explicit_skill(tmp_path):
+def test_single_skill_requires_description_match_or_explicit_invocation(tmp_path):
     copy_skill(tmp_path)
     router = SkillRouter(tmp_path)
 
-    assert router.route("unclassified maintenance").route_id == "other"
-    assert router.route("/codey inspect something").skill_name == "codey"
+    unmatched = router.route("unclassified maintenance")
+    assert unmatched.skill_name == ""
+    assert unmatched.selection_source == "no_description_match"
+    explicit = router.route("/codey inspect something")
+    assert explicit.skill_name == "codey"
+    assert explicit.route_id == "other"
     with pytest.raises(SkillConfigurationError, match="unknown skill"):
         router.route("/missing inspect something")
 
@@ -70,15 +74,23 @@ def test_rejects_route_path_escape(tmp_path):
     skill_file.write_text(text, encoding="utf-8")
 
     with pytest.raises(SkillConfigurationError, match="invalid skill read path"):
-        SkillRouter(tmp_path).route("prompt")
+        SkillRouter(tmp_path).route("/codey prompt")
 
 
-def test_multiple_skills_without_match_is_ambiguous(tmp_path):
+def test_multiple_skills_without_match_returns_auditable_no_selection(tmp_path):
     first = copy_skill(tmp_path)
     second = tmp_path / "skills" / "other-skill"
     shutil.copytree(first, second)
-    text = (second / "SKILL.md").read_text(encoding="utf-8").replace("name: codey", "name: other-skill").replace('triggers: ["CodeY", "coding agent", "本地编码 Agent", "技能路由"]', 'triggers: ["other domain"]')
+    text = (second / "SKILL.md").read_text(encoding="utf-8").replace(
+        "name: codey",
+        "name: other-skill",
+    ).replace(
+        "description: This skill should be used when the user's primary objective is to maintain or extend the CodeY local coding-agent runtime, and the request is best characterized as \"CodeY agent runtime engineering\" or \"local coding assistant harness\". It should not activate for generic source-code questions, unrelated agent products, or ordinary application feature work.",
+        "description: This skill should be used when the user's primary objective is to maintain another local runtime and the request is best characterized as \"other runtime lifecycle maintenance\" or \"alternative assistant harness engineering\". It should not activate for generic source-code questions, CodeY runtime changes, or ordinary application feature work.",
+    )
     (second / "SKILL.md").write_text(text, encoding="utf-8")
 
-    with pytest.raises(SkillConfigurationError, match="does not select a skill"):
-        SkillRouter(tmp_path).route("unknown request")
+    match = SkillRouter(tmp_path).route("unknown request")
+    assert match.skill_name == ""
+    assert match.selection_source == "no_description_match"
+    assert len(match.candidates) == 2

@@ -12,6 +12,8 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..providers.clients import ModelCompletion
+
 
 SCHEMA_VERSION = 1
 RESULTS_SCHEMA_VERSION = 2
@@ -1054,15 +1056,16 @@ def run_probe(client, prompt, case, max_output_tokens=800, parse_retries=1):
     current_prompt = prompt
     for attempt in range(int(parse_retries) + 1):
         started = time.perf_counter()
-        response = client.complete(current_prompt, max_new_tokens=max_output_tokens)
+        completion = client.complete(current_prompt, max_new_tokens=max_output_tokens)
+        if not isinstance(completion, ModelCompletion):
+            raise TypeError("long-context evaluation clients must return ModelCompletion")
+        response = completion.text
         elapsed = time.perf_counter() - started
         record = {
             "attempt": attempt + 1,
             "elapsed_seconds": elapsed,
             "response_chars": len(response),
-            "provider_metadata": _safe_provider_metadata(
-                getattr(client, "last_completion_metadata", {}) or {}
-            ),
+            "provider_metadata": _safe_provider_metadata(completion.metadata),
         }
         try:
             parsed = parse_probe_response(response, case)

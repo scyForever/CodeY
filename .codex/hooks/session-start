@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# session-start — re-inject the skill-based-architecture SKILL.md on startup/clear/compact.
+#
+# The hook ensures that after /clear or /compact the project Skill constraints
+# and task-routing table do not drift out of memory.
+
+set -euo pipefail
+
+SKILL_PATH="${SKILL_PATH:-skills/codey/SKILL.md}"
+HARNESS="${CLAUDE_HARNESS:-${SESSION_HARNESS:-claude}}"
+
+if [[ ! -f "$SKILL_PATH" ]]; then
+  exit 0
+fi
+
+if command -v python >/dev/null 2>&1; then
+  PYTHON_BIN=python
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN=python3
+else
+  exit 1
+fi
+
+SKILL_BODY=$("$PYTHON_BIN" -c '
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    print(json.dumps(f.read()))
+' "$SKILL_PATH")
+
+case "$HARNESS" in
+  cursor)
+    printf '{"additional_context": %s}\n' "$SKILL_BODY"
+    ;;
+  claude|claude-code)
+    printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":%s}}\n' "$SKILL_BODY"
+    ;;
+  copilot|opencode|gemini|*)
+    printf '{"additionalContext": %s}\n' "$SKILL_BODY"
+    ;;
+esac

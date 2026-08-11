@@ -486,7 +486,35 @@ class PatchGenerator:
 class EvolutionStore:
     """Persist structured patches and derived human-readable knowledge views."""
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
+    PATCH_REQUIRED_FIELDS = {
+        "schema_version",
+        "patch_id",
+        "fingerprint",
+        "rule_candidate_fingerprint",
+        "type",
+        "scope",
+        "correction",
+        "trigger_conditions",
+        "source",
+        "status",
+        "metrics",
+        "created_at",
+        "updated_at",
+        "history",
+        "observed_run_ids",
+        "materialized",
+    }
+    METRIC_FIELDS = {
+        "eligible_count",
+        "exposed_count",
+        "triggered_count",
+        "success_count",
+        "harmful_count",
+        "exposure_rate",
+        "hit_rate",
+        "success_rate",
+    }
 
     def __init__(self, root):
         self.root = Path(root)
@@ -497,14 +525,18 @@ class EvolutionStore:
             return []
         patches = []
         for path in sorted(self.patches_dir.glob("patch_*.json")):
-            patches.append(json.loads(path.read_text(encoding="utf-8")))
+            patch = json.loads(path.read_text(encoding="utf-8"))
+            self._validate_patch(patch)
+            patches.append(patch)
         return patches
 
     def load_patch(self, patch_id):
         path = self.patches_dir / f"{patch_id}.json"
         if not path.exists():
             raise KeyError(f"unknown cognitive patch: {patch_id}")
-        return json.loads(path.read_text(encoding="utf-8"))
+        patch = json.loads(path.read_text(encoding="utf-8"))
+        self._validate_patch(patch)
+        return patch
 
     def create_candidate(self, candidate):
         self._validate_candidate(candidate)
@@ -517,11 +549,14 @@ class EvolutionStore:
         ).hexdigest()
         rule_fingerprint = str(candidate.get("source", {}).get("rule_candidate_fingerprint", ""))
         if not re.fullmatch(r"[0-9a-f]{64}", rule_fingerprint):
-            rule_fingerprint = content_fingerprint
+            raise ValueError("candidate must contain a valid rule_candidate_fingerprint")
         patch_id = "patch_" + rule_fingerprint[:16]
         path = self.patches_dir / f"{patch_id}.json"
         if path.exists():
-            return self.load_patch(patch_id), False
+            existing = self.load_patch(patch_id)
+            if existing["rule_candidate_fingerprint"] != rule_fingerprint:
+                raise ValueError("cognitive patch id collision detected")
+            return existing, False
         timestamp = _utc_now()
         generation_reason = (
             "hybrid_supervised_generation"
@@ -537,9 +572,11 @@ class EvolutionStore:
             "status": "draft",
             "metrics": {
                 "eligible_count": 0,
-                "hit_count": 0,
+                "exposed_count": 0,
+                "triggered_count": 0,
                 "success_count": 0,
                 "harmful_count": 0,
+                "exposure_rate": 0.0,
                 "hit_rate": 0.0,
                 "success_rate": 0.0,
             },
@@ -560,7 +597,8 @@ class EvolutionStore:
         return patch, True
 
     def save_patch(self, patch):
-        patch_id = str(patch.get("patch_id", ""))
+        self._validate_patch(patch)
+        patch_id = str(patch["patch_id"])
         if not patch_id.startswith("patch_"):
             raise ValueError("invalid cognitive patch id")
         if patch.get("status") not in PATCH_STATUSES:
@@ -576,9 +614,7 @@ class EvolutionStore:
         timestamp = _utc_now()
         patch["status"] = target_status
         patch["updated_at"] = timestamp
-        patch.setdefault("history", []).append(
-            {"from": current, "to": target_status, "reason": str(reason), "at": timestamp}
-        )
+        patch["history"].append({"from": current, "to": target_status, "reason": str(reason), "at": timestamp})
         if target_status == "active":
             patch["materialized"] = True
             patch["materialized_at"] = timestamp
@@ -621,6 +657,86 @@ class EvolutionStore:
             raise ValueError("cognitive patch correction must contain an action")
         if not isinstance(candidate.get("trigger_conditions"), list) or not candidate["trigger_conditions"]:
             raise ValueError("cognitive patch requires trigger conditions")
+        for condition in candidate["trigger_conditions"]:
+            if not isinstance(condition, dict) or set(condition) != {"signal", "equals"}:
+                raise ValueError("cognitive patch trigger conditions must contain signal and equals")
+            if not isinstance(condition["signal"], str) or not isinstance(condition["equals"], str):
+                raise ValueError("cognitive patch trigger condition values must be strings")
+
+    def _validate_patch(self, patch):
+        if not isinstance(patch, dict) or patch.get("schema_version") != self.SCHEMA_VERSION:
+            raise ValueError(f"cognitive patch schema_version must be {self.SCHEMA_VERSION}")
+        allowed = set(self.PATCH_REQUIRED_FIELDS) | {"materialized_at"}
+        if set(patch) - allowed or not self.PATCH_REQUIRED_FIELDS.issubset(patch):
+            raise ValueError("cognitive patch has unknown or missing fields")
+        if patch["type"] not in PATCH_TYPES or patch["status"] not in PATCH_STATUSES:
+            raise ValueError("cognitive patch type/status is invalid")
+        if not isinstance(patch["scope"], dict) or not isinstance(patch["correction"], dict):
+            raise ValueError("cognitive patch scope/correction is invalid")
+        if not isinstance(patch["trigger_conditions"], list) or not patch["trigger_conditions"]:
+            raise ValueError("cognitive patch trigger_conditions is invalid")
+        self._validate_candidate(patch)
+        if not isinstance(patch["metrics"], dict) or set(patch["metrics"]) != self.METRIC_FIELDS:
+            raise ValueError("cognitive patch metrics schema is invalid")
+        if not re.fullmatch(r"patch_[0-9a-f]{16}", str(patch["patch_id"])):
+            raise ValueError("cognitive patch id is invalid")
+        for key in ("fingerprint", "rule_candidate_fingerprint"):
+            if not re.fullmatch(r"[0-9a-f]{64}", str(patch[key])):
+                raise ValueError(f"cognitive patch {key} is invalid")
+        count_fields = (
+            "eligible_count",
+            "exposed_count",
+            "triggered_count",
+            "success_count",
+            "harmful_count",
+        )
+        for key in count_fields:
+            value = patch["metrics"][key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"cognitive patch metric {key} must be a non-negative integer")
+        rate_fields = ("exposure_rate", "hit_rate", "success_rate")
+        for key in rate_fields:
+            value = patch["metrics"][key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"cognitive patch metric {key} must be a rate")
+        metrics = patch["metrics"]
+        if not (
+            metrics["success_count"] <= metrics["triggered_count"] <= metrics["exposed_count"] <= metrics["eligible_count"]
+            and metrics["harmful_count"] <= metrics["triggered_count"]
+        ):
+            raise ValueError("cognitive patch metric counts are inconsistent")
+        expected_rates = {
+            "exposure_rate": metrics["exposed_count"] / metrics["eligible_count"]
+            if metrics["eligible_count"]
+            else 0.0,
+            "hit_rate": metrics["triggered_count"] / metrics["exposed_count"]
+            if metrics["exposed_count"]
+            else 0.0,
+            "success_rate": metrics["success_count"] / metrics["triggered_count"]
+            if metrics["triggered_count"]
+            else 0.0,
+        }
+        if any(abs(float(metrics[key]) - expected) > 1e-9 for key, expected in expected_rates.items()):
+            raise ValueError("cognitive patch metric rates are inconsistent")
+        if not isinstance(patch["source"], dict):
+            raise ValueError("cognitive patch source is invalid")
+        if not isinstance(patch["history"], list) or not patch["history"]:
+            raise ValueError("cognitive patch history is invalid")
+        if any(
+            not isinstance(item, dict)
+            or set(item) != {"from", "to", "reason", "at"}
+            or any(not isinstance(item[key], str) for key in item)
+            for item in patch["history"]
+        ):
+            raise ValueError("cognitive patch history entries are invalid")
+        if (
+            not isinstance(patch["observed_run_ids"], list)
+            or any(not isinstance(item, str) or not item for item in patch["observed_run_ids"])
+            or len(patch["observed_run_ids"]) != len(set(patch["observed_run_ids"]))
+        ):
+            raise ValueError("cognitive patch history/observed_run_ids is invalid")
+        if not isinstance(patch["materialized"], bool):
+            raise ValueError("cognitive patch materialized flag is invalid")
 
     @staticmethod
     def _write_collection(path, title, patches):
@@ -699,42 +815,46 @@ class SafetyGate:
             return self.store.transition(patch, "review_required", "human_review_required")
         return self.store.transition(patch, "shadow", "eligible_for_shadow_rollout")
 
-    def observe(self, patch, *, run_id, eligible, hit, success, harmful):
-        observed_run_ids = patch.setdefault("observed_run_ids", [])
+    def observe(self, patch, *, run_id, eligible, exposed, triggered, success, harmful):
+        observed_run_ids = patch["observed_run_ids"]
         if run_id and run_id in observed_run_ids:
             return patch, None
         if run_id:
             observed_run_ids.append(run_id)
-        metrics = patch.setdefault("metrics", {})
+        metrics = patch["metrics"]
         if eligible:
-            metrics["eligible_count"] = int(metrics.get("eligible_count", 0)) + 1
-        if hit:
-            metrics["hit_count"] = int(metrics.get("hit_count", 0)) + 1
+            metrics["eligible_count"] += 1
+        if exposed:
+            metrics["exposed_count"] += 1
+        if triggered:
+            metrics["triggered_count"] += 1
             if success:
-                metrics["success_count"] = int(metrics.get("success_count", 0)) + 1
+                metrics["success_count"] += 1
             if harmful:
-                metrics["harmful_count"] = int(metrics.get("harmful_count", 0)) + 1
-        eligible_count = int(metrics.get("eligible_count", 0))
-        hit_count = int(metrics.get("hit_count", 0))
-        success_count = int(metrics.get("success_count", 0))
-        metrics["hit_rate"] = hit_count / eligible_count if eligible_count else 0.0
-        metrics["success_rate"] = success_count / hit_count if hit_count else 0.0
+                metrics["harmful_count"] += 1
+        eligible_count = metrics["eligible_count"]
+        exposed_count = metrics["exposed_count"]
+        triggered_count = metrics["triggered_count"]
+        success_count = metrics["success_count"]
+        metrics["exposure_rate"] = exposed_count / eligible_count if eligible_count else 0.0
+        metrics["hit_rate"] = triggered_count / exposed_count if exposed_count else 0.0
+        metrics["success_rate"] = success_count / triggered_count if triggered_count else 0.0
         patch["updated_at"] = _utc_now()
         self.store.save_patch(patch)
 
         status = patch["status"]
-        if not hit or status not in {"shadow", "active"}:
+        if not triggered or status not in {"shadow", "active"}:
             return patch, None
         if harmful:
             return self.store.transition(patch, "expired", "harmful_canary_outcome"), "expired"
         if (
-            hit_count >= self.thresholds.expiry_min_hits
+            triggered_count >= self.thresholds.expiry_min_hits
             and metrics["success_rate"] < self.thresholds.expiry_success_rate
         ):
             return self.store.transition(patch, "expired", "success_rate_below_expiry_threshold"), "expired"
         if status == "shadow" and patch["type"] in AUTO_ACTIVATE_TYPES:
             if (
-                hit_count >= self.thresholds.min_canary_hits
+                triggered_count >= self.thresholds.min_canary_hits
                 and metrics["hit_rate"] >= self.thresholds.min_canary_hit_rate
                 and metrics["success_rate"] >= self.thresholds.min_canary_success_rate
             ):
@@ -759,8 +879,6 @@ class CognitiveLoop:
 
     def prepare_run(self, task_state):
         eligible_ids = []
-        active_ids = []
-        shadow_ids = []
         guidance = []
         for patch in self.store.list_patches():
             if patch["status"] not in {"shadow", "active"}:
@@ -769,23 +887,34 @@ class CognitiveLoop:
                 continue
             eligible_ids.append(patch["patch_id"])
             if patch["status"] == "active":
-                active_ids.append(patch["patch_id"])
                 guidance.append(("active", patch))
             elif self._selected_for_canary(task_state.run_id, patch["patch_id"]):
-                shadow_ids.append(patch["patch_id"])
                 guidance.append(("shadow", patch))
+        guidance.sort(
+            key=lambda item: (
+                int(item[1]["metrics"]["exposed_count"]),
+                0 if item[0] == "active" else 1,
+                item[1]["patch_id"],
+            )
+        )
+        exposed = guidance[:8]
+        active_ids = [patch["patch_id"] for mode, patch in exposed if mode == "active"]
+        shadow_ids = [patch["patch_id"] for mode, patch in exposed if mode == "shadow"]
+        exposed_ids = [patch["patch_id"] for _, patch in exposed]
         context = {
             "enabled": True,
             "eligible_patch_ids": eligible_ids,
+            "exposed_patch_ids": exposed_ids,
             "active_patch_ids": active_ids,
             "shadow_patch_ids": shadow_ids,
+            "exposure_scheduler": "least_exposed_first_v1",
             "thresholds": self.thresholds.to_dict(),
             "llm_advisor": self.advisor.config.to_dict(),
         }
         lines = ["Adaptive cognitive patches:"]
-        for mode, patch in guidance[:8]:
+        for mode, patch in exposed:
             lines.append(f"- [{mode}:{patch['type']}:{patch['patch_id']}] {patch['correction']['action']}")
-        return context, "\n".join(lines) if guidance else ""
+        return context, "\n".join(lines) if exposed else ""
 
     def complete_run(self, task_state, tool_events, stale_paths=(), redactor=None):
         trace = TraceCollector.collect(task_state, tool_events, stale_paths=stale_paths)
@@ -874,22 +1003,21 @@ class CognitiveLoop:
         return patch
 
     def _observe_existing(self, task_state, trace, outcome):
-        context = dict(getattr(task_state, "evolution_context", {}) or {})
-        eligible_ids = set(context.get("eligible_patch_ids", []))
-        hit_ids = set(context.get("active_patch_ids", [])) | set(context.get("shadow_patch_ids", []))
+        context = dict(task_state.evolution_context)
+        eligible_ids = set(context["eligible_patch_ids"])
+        exposed_ids = set(context["exposed_patch_ids"])
         transitions = []
         for patch_id in sorted(eligible_ids):
-            try:
-                patch = self.store.load_patch(patch_id)
-            except KeyError:
-                continue
+            patch = self.store.load_patch(patch_id)
             before = patch["status"]
-            hit = patch_id in hit_ids and self._trigger_matches(patch, trace)
+            exposed = patch_id in exposed_ids
+            triggered = exposed and self._trigger_matches(patch, trace)
             patch, transition = self.safety_gate.observe(
                 patch,
                 run_id=str(task_state.run_id),
                 eligible=True,
-                hit=hit,
+                exposed=exposed,
+                triggered=triggered,
                 success=outcome["label"] == "correct",
                 harmful=outcome["label"] == "harmful",
             )
@@ -906,7 +1034,7 @@ class CognitiveLoop:
 
     @staticmethod
     def _trigger_matches(patch, trace):
-        conditions = list(patch.get("trigger_conditions", []) or [])
+        conditions = list(patch["trigger_conditions"])
         events = list(trace.get("tool_events", []) or [])
         trace_paths = {
             path
@@ -914,23 +1042,34 @@ class CognitiveLoop:
             for path in [event.get("path", ""), *event.get("affected_paths", [])]
             if path
         }
+        matches = []
         for condition in conditions:
             signal = str(condition.get("signal", ""))
             expected = str(condition.get("equals", ""))
-            if signal == "tool_name" and any(event.get("name") == expected for event in events):
-                return True
-            if signal in {"path", "stale_path"} and expected != REDACTED_PATH and expected in trace_paths:
-                return True
-            if signal == "route_id" and trace.get("scope", {}).get("route_id", "") == expected:
-                return True
-            if signal == "tool_failure" and any(
-                expected in {event.get("error_code"), event.get("security_event_type"), event.get("status")}
-                for event in events
-            ):
-                return True
-            if signal == "task_scope":
-                return True
-        return False
+            if signal == "tool_name":
+                matches.append(any(event.get("name") == expected for event in events))
+            elif signal in {"path", "stale_path"}:
+                matches.append(expected != REDACTED_PATH and expected in trace_paths)
+            elif signal == "route_id":
+                matches.append(trace.get("scope", {}).get("route_id", "") == expected)
+            elif signal == "tool_failure":
+                matches.append(
+                    any(
+                        expected
+                        in {event.get("error_code"), event.get("security_event_type"), event.get("status")}
+                        for event in events
+                    )
+                )
+            elif signal == "task_scope":
+                scope = trace.get("scope", {})
+                matches.append(
+                    expected == "workspace"
+                    or expected == scope.get("route_id", "")
+                    or expected == scope.get("skill_name", "")
+                )
+            else:
+                matches.append(False)
+        return bool(matches) and all(matches)
 
     def _reflection(self, trace, outcome, root_cause):
         knowledge = self.generator.knowledge_facts(trace, outcome)

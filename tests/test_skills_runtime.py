@@ -17,8 +17,7 @@ def write_skill(root, name="demo"):
     (skill / "SKILL.md").write_text(
         f'''---
 name: {name}
-description: Demo coding agent skill
-triggers: ["demo", "演示"]
+description: This skill should be used when the user's primary objective concerns the {name} project runtime and the request matches "{name} prompt runtime change" or "{name} tool safety maintenance". It should not activate for generic source review, unrelated product planning, or ordinary interface styling.
 ---
 <always-applicable>
 Always Read:
@@ -57,14 +56,14 @@ def test_progressive_two_level_routing(tmp_path):
     assert "CORE-ONLY" in context.text
     assert "PROMPT-DETAIL" not in context.text
 
-    match = router.route("请修改提示词 prompt")
+    match = router.route("demo prompt runtime change 请修改提示词 prompt")
     assert match.skill_name == "demo"
     assert match.route_id == "prompt"
     assert "PROMPT-WORKFLOW" in match.route_context
     assert "PROMPT-DETAIL" in match.route_context
     assert "TOOLS-DETAIL" not in match.route_context
 
-    fallback = router.route("demo unrelated request")
+    fallback = router.route("/demo unrelated request")
     assert fallback.route_id == "other"
     assert fallback.fallback is True
 
@@ -80,7 +79,7 @@ def test_explicit_unknown_and_path_escape_fail(tmp_path):
     skill_file.write_text(text, encoding="utf-8")
     router = SkillRouter(tmp_path)
     with pytest.raises(SkillConfigurationError, match="invalid skill read path|escapes"):
-        router.route("tool")
+        router.route("/demo tool")
 
 
 def test_session_start_lifecycle_and_xml_prefix(tmp_path):
@@ -103,12 +102,12 @@ def test_session_start_lifecycle_and_xml_prefix(tmp_path):
 def test_runtime_reroutes_each_ask_and_persists_metadata(tmp_path):
     write_skill(tmp_path)
     agent = build_agent(tmp_path, ["<final>one</final>", "<final>two</final>"])
-    assert agent.ask("demo prompt change") == "one"
+    assert agent.ask("demo prompt runtime change") == "one"
     first_hash = agent.prefix_state.hash
     first_run = agent.current_task_state.run_id
     assert agent.current_task_state.route_id == "prompt"
 
-    assert agent.ask("demo tool change") == "two"
+    assert agent.ask("demo tool safety maintenance") == "two"
     assert agent.current_task_state.route_id == "tools"
     assert agent.prefix_state.hash == first_hash
 
@@ -121,10 +120,31 @@ def test_runtime_reroutes_each_ask_and_persists_metadata(tmp_path):
 def test_route_context_is_between_prefix_and_memory_and_request_is_preserved(tmp_path):
     write_skill(tmp_path)
     agent = build_agent(tmp_path)
-    agent.route_task("demo prompt")
+    agent.route_task("demo prompt runtime change", run_id="run-test", task_id="task-test")
     manager = ContextManager(agent, total_budget=9000)
     request = "CURRENT-REQUEST-UNTRUNCATED"
     prompt, metadata = manager.build(request)
-    assert prompt.index("<always-applicable>") < prompt.index("Selected task route: prompt") < prompt.index("Memory:")
+    assert prompt.index("<always-applicable>") < prompt.index('<task-route id="prompt"') < prompt.index("Memory:")
     assert prompt.endswith(f"Current user request:\n{request}")
     assert metadata["route"]["route_id"] == "prompt"
+
+
+def test_compact_session_start_rebuilds_the_current_model_prompt(tmp_path):
+    write_skill(tmp_path)
+    agent = build_agent(tmp_path, ["<final>done</final>"])
+    agent.context_manager = ContextManager(agent, total_budget=1000)
+    original_compact = agent.compact_session_context
+
+    def compact_with_marker(run_id):
+        restored = original_compact(run_id)
+        if restored:
+            agent.prefix = "COMPACT-SESSION-START-MARKER\n" + agent.prefix
+        return restored
+
+    agent.compact_session_context = compact_with_marker
+
+    assert agent.ask("demo prompt runtime change") == "done"
+    assert "COMPACT-SESSION-START-MARKER" in agent.model_client.prompts[-1]
+    trace_path = agent.run_store.trace_path(agent.current_task_state.run_id)
+    events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert any(event["event"] == "prompt_rebuilt_after_compact" for event in events)

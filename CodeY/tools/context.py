@@ -12,7 +12,8 @@ class ToolContext:
     shell_env_provider: Callable[[], dict]
     depth: int
     max_depth: int
-    spawn_delegate: Callable[[dict], str]
+    spawn_fork: Callable[[dict], str]
+    max_fork_branches: int
 
     def path(self, raw_path):
         return self.path_resolver(str(raw_path))

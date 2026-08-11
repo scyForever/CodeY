@@ -19,9 +19,9 @@ STOP_REASON_RETRY_LIMIT_REACHED = "retry_limit_reached"
 STOP_REASON_MODEL_ERROR = "model_error"
 STOP_REASON_TOOL_TIMEOUT = "tool_timeout"
 STOP_REASON_APPROVAL_DENIED = "approval_denied"
-STOP_REASON_DELEGATE_FAILED = "delegate_failed"
 STOP_REASON_PERSISTENCE_ERROR = "persistence_error"
 STOP_REASON_RESUME_LOAD_ERROR = "resume_load_error"
+TASK_STATE_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -41,7 +41,15 @@ class TaskState:
     route_id: str = ""
     route_fallback: bool = False
     route_match_terms: tuple[str, ...] = ()
+    routing_event_id: str = ""
     evolution_context: dict = field(default_factory=dict)
+    graph_thread_id: str = ""
+    phase: str = "think"
+    parent_run_id: str = ""
+    fork_id: str = ""
+    branch_id: str = ""
+    fork_count: int = 0
+    fork_summary: dict = field(default_factory=dict)
 
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
@@ -51,23 +59,64 @@ class TaskState:
 
     @classmethod
     def from_dict(cls, data):
+        required = {
+            "schema_version",
+            "run_id",
+            "task_id",
+            "user_request",
+            "status",
+            "tool_steps",
+            "attempts",
+            "last_tool",
+            "stop_reason",
+            "final_answer",
+            "checkpoint_id",
+            "resume_status",
+            "skill_name",
+            "route_id",
+            "route_fallback",
+            "route_match_terms",
+            "routing_event_id",
+            "evolution_context",
+            "graph_thread_id",
+            "phase",
+            "parent_run_id",
+            "fork_id",
+            "branch_id",
+            "fork_count",
+            "fork_summary",
+        }
+        if not isinstance(data, dict) or data.get("schema_version") != TASK_STATE_SCHEMA_VERSION:
+            raise ValueError(
+                f"task state schema_version must be {TASK_STATE_SCHEMA_VERSION}; legacy task states are not supported"
+            )
+        if set(data) != required:
+            raise ValueError("task state has unknown or missing fields")
         return cls(
-            run_id=str(data.get("run_id", "")),
-            task_id=str(data.get("task_id", "")),
-            user_request=str(data.get("user_request", "")),
-            status=str(data.get("status", STATUS_RUNNING)),
-            tool_steps=int(data.get("tool_steps", 0)),
-            attempts=int(data.get("attempts", 0)),
-            last_tool=str(data.get("last_tool", "")),
-            stop_reason=str(data.get("stop_reason", "")),
-            final_answer=str(data.get("final_answer", "")),
-            checkpoint_id=str(data.get("checkpoint_id", "")),
-            resume_status=str(data.get("resume_status", "")),
-            skill_name=str(data.get("skill_name", "")),
-            route_id=str(data.get("route_id", "")),
-            route_fallback=bool(data.get("route_fallback", False)),
-            route_match_terms=tuple(str(item) for item in data.get("route_match_terms", [])),
-            evolution_context=dict(data.get("evolution_context", {}) or {}),
+            run_id=str(data["run_id"]),
+            task_id=str(data["task_id"]),
+            user_request=str(data["user_request"]),
+            status=str(data["status"]),
+            tool_steps=int(data["tool_steps"]),
+            attempts=int(data["attempts"]),
+            last_tool=str(data["last_tool"]),
+            stop_reason=str(data["stop_reason"]),
+            final_answer=str(data["final_answer"]),
+            checkpoint_id=str(data["checkpoint_id"]),
+            resume_status=str(data["resume_status"]),
+            skill_name=str(data["skill_name"]),
+            route_id=str(data["route_id"]),
+            route_fallback=bool(data["route_fallback"]),
+            route_match_terms=tuple(str(item) for item in data["route_match_terms"]),
+            routing_event_id=str(data["routing_event_id"]),
+            evolution_context=dict(data["evolution_context"]),
+            graph_thread_id=str(data["graph_thread_id"]),
+            phase=str(data["phase"]),
+            parent_run_id=str(data["parent_run_id"]),
+            fork_id=str(data["fork_id"]),
+            branch_id=str(data["branch_id"]),
+            fork_count=int(data["fork_count"]),
+            fork_summary=dict(data["fork_summary"]),
         )
 
     def record_attempt(self):
@@ -106,6 +155,7 @@ class TaskState:
 
     def to_dict(self):
         return {
+            "schema_version": TASK_STATE_SCHEMA_VERSION,
             "run_id": self.run_id,
             "task_id": self.task_id,
             "user_request": self.user_request,
@@ -121,5 +171,13 @@ class TaskState:
             "route_id": self.route_id,
             "route_fallback": self.route_fallback,
             "route_match_terms": list(self.route_match_terms),
+            "routing_event_id": self.routing_event_id,
             "evolution_context": dict(self.evolution_context),
+            "graph_thread_id": self.graph_thread_id,
+            "phase": self.phase,
+            "parent_run_id": self.parent_run_id,
+            "fork_id": self.fork_id,
+            "branch_id": self.branch_id,
+            "fork_count": self.fork_count,
+            "fork_summary": dict(self.fork_summary),
         }

@@ -1,12 +1,13 @@
 # 规则 + LLM 自进化闭环风险登记
 
-更新日期：2026-07-23  
+更新日期：2026-08-11
 适用范围：`CodeY/evolution/cognitive.py`、`CodeY/evolution/hybrid.py`、Runtime 接入、Patch 存储与知识视图。
 
 本文记录本轮实现与复核中识别出的全部已知风险。它不是“功能已经失效”的结论，而是对当前证据边界、残余风险和后续治理工作的诚实说明。状态含义如下：
 
 - **未解决**：当前实现没有直接控制措施。
 - **部分缓解**：已有护栏，但不能消除该风险。
+- **已解决**：原缺陷已有代码和回归测试覆盖；条目保留用于审计追溯。
 - **设计边界**：出于保守性主动接受的能力限制。
 - **验证缺口**：代码已有实现，但尚未获得相应环境或规模的验证。
 
@@ -21,6 +22,7 @@
 - 已知 secret、diff、控制字符和命令形态文本会被拒绝；非法输出和 provider 异常回退到规则结果。
 - Policy 和 Definition 必须进入人工审核；Strategy、Action Chain 和 Experience 只能先进入 shadow。
 - Patch 使用规则候选指纹稳定身份，避免仅因 LLM 改写措辞而无限生成重复 Patch。
+- Patch 分开记录 eligible、exposed、triggered、success 和 harmful；只有实际渲染的 Patch 才属于 exposed。
 - 审计只保存模型标识、prompt 版本/hash、结构化结果、证据引用和错误码，不保存 Advisor 原始响应。
 
 ## A. 结果正确性与认识论风险
@@ -45,13 +47,13 @@
 |---|---|---|---|---|
 | EVA-01 | 高 | 未解决 | shadow 不是离线观察：被选中的 guidance 会真实进入 prompt，在激活前就可能改变 Agent 行为并造成伤害。 | harmful 命中后可立即 expired，但首次有害暴露无法预先撤销。 |
 | EVA-02 | 高 | 未解决 | “暴露”和“命中”定义不一致。Patch 已注入 prompt，但若执行 trace 未出现声明的工具/路径则不计 hit；反之，出现触发器也不能证明模型实际遵循了 guidance。 | 当前 hit 是事后 trace 匹配，不是可观测的策略采用信号。 |
-| EVA-03 | 高 | 未解决 | prompt 最多渲染 `guidance[:8]`，但 context 会记录全部 active id 和全部被选中的 shadow id。第 9 条以后的 Patch 可能未展示给模型，却仍被当作 exposed/hit 候选统计。 | 需要让 `active_patch_ids`/`shadow_patch_ids` 只包含实际渲染的 Patch。 |
+| EVA-03 | 高 | 已解决 | 旧实现曾把未渲染的第 9 条及后续 Patch 当作 exposed/hit 候选。 | 当前 `exposed_patch_ids`、`active_patch_ids` 和 `shadow_patch_ids` 只来自实际渲染的前 8 条；eligible 但未 exposed 的 Patch 只增加 eligible 计数。 |
 | EVA-04 | 高 | 未解决 | 多个 Patch 同时注入时，只要各自触发，就会共享同一个任务 Outcome；系统无法区分成功或失败由哪条 Patch 导致，也无法识别 Patch 交互。 | 尚无单 Patch 隔离实验、互斥分桶或多变量归因。 |
 | EVA-05 | 高 | 未解决 | 激活依据是命中率和命中任务成功率，没有未使用 Patch 的同 scope 对照组、uplift 或置信区间。简单任务、时间趋势和其他改动都可能造成伪提升。 | 当前指标适合运行监控，不足以单独证明因果有效性。 |
 | EVA-06 | 中 | 未解决 | 默认最少 3 次命中即可激活，样本很小；全局阈值也没有按 Patch 类型、风险或 scope 难度校准。 | 可通过配置提高阈值，但配置校验只检查范围，不检查统计合理性。 |
-| EVA-07 | 高 | 未解决 | 触发条件采用 OR 语义，不能表达“工具 + 路径 + 错误码”同时满足；`task_scope` 条件当前直接返回 true，`equals` 不参与约束，可能产生宽泛命中。 | Advisor 只能把条件缩小到规则条件子集，不能增加安全的 AND 组合。 |
+| EVA-07 | 高 | 部分缓解 | 触发条件已经改为严格 AND，可表达“工具 + 路径 + 错误码”同时满足；但 `task_scope=workspace` 仍是显式全工作区通配条件，过宽规则会扩大命中范围。 | 未知 signal 会判为 false，Advisor 仍只能把条件缩小到规则条件子集；需要继续限制通配 scope 的生成条件。 |
 | EVA-08 | 中 | 未解决 | 运行前 scope 只匹配 `skill_name` 和 `route_id`，`target_tool` 尚不可用，因此同 route 的无关任务也可能收到工具相关 guidance。 | 事后可能不计 hit，但 prompt 已经受到影响。 |
-| EVA-09 | 中 | 未解决 | Patch 按 Patch 文件名排序后只展示前 8 条，没有优先级、风险、置信度、互斥、近期表现或公平轮转；部分 Patch 可能长期饥饿。 | 尚无 Patch 调度器。 |
+| EVA-09 | 中 | 部分缓解 | 每轮最多展示 8 条 Patch，仍没有风险优先级、语义互斥或近期表现调度。 | 已采用 `least_exposed_first_v1`，优先选择累计 exposed 次数更少的 eligible Patch，消除固定文件名排序导致的长期饥饿；冲突和风险排序仍未解决。 |
 | EVA-10 | 中 | 未解决 | Knowledge Experience 在“再次读取同一路径且任务成功”后可能激活，但这不能证明该知识指导对成功有贡献。 | 与 EVA-02、EVA-05 相同，需要可观测采用信号和对照评估。 |
 | EVA-11 | 中 | 未解决 | 低频、低质量但未达到 100 次命中的 shadow/active Patch 可能长期不 expired；route 重构后永远不再命中的 Patch 也没有 TTL。 | 当前只有命中次数、成功率和 harmful 驱动的过期，没有时间衰减。 |
 
@@ -86,7 +88,7 @@
 | STO-02 | 中 | 未解决 | `observed_run_ids` 对每个 eligible run 持续增长；Patch JSON、过期审计记录和物化视图也没有 retention/compaction，长期运行会增加 I/O 和存储。 | 尚无滚动窗口、聚合计数、归档或容量上限。 |
 | STO-03 | 中 | 未解决 | 只有命中表现触发过期，没有基于代码版本、route 版本、文件 freshness 或时间的失效机制。代码重构后，旧 Patch 可能继续 active 或成为永久孤儿。 | stale-path 只覆盖当前任务发现的部分文件摘要。 |
 | STO-04 | 中 | 部分缓解 | Patch 的 evidence ref 如 `tool_001` 只在 run 内有意义；当前 cognitive report 保存引用，但没有持久化一份显式 `evidence_id -> 规范化事件` 映射。删除或缺失 run trace 后，来源难以独立复核。 | trace 顺序可人工推断，但不是稳定的机器可解析 provenance contract。 |
-| STO-05 | 中 | 部分缓解 | Schema 已增加到 v2，但没有显式迁移器。旧 Patch 可以被宽松加载，却不会自动补齐 Advisor/source 字段；外部消费者若只理解 v1 或假定 fingerprint 语义可能不兼容。 | 当前仓库测试覆盖内部兼容，未覆盖第三方消费者。 |
+| STO-05 | 中 | 设计边界 | Patch schema 已升级到 v3，并严格拒绝旧版本、未知/缺失字段和旧 `hit_count` 指标；没有内置迁移器。 | 这是“不隐式兼容旧实现”的主动边界；如需保留历史 Patch，必须在运行时之外显式迁移并重新验证。 |
 | STO-06 | 低 | 未解决 | Patch id 只使用规则候选 SHA-256 的前 16 个十六进制字符。碰撞概率很低，但 path 已存在时当前不会再比较完整 rule fingerprint，理论上可能错误合并。 | Patch 同时保存完整 fingerprint，但创建路径尚未做碰撞拒绝。 |
 | STO-07 | 中 | 部分缓解 | 物化视图刷新/删除失败会让 cognitive loop 报错并被主任务隔离，主任务仍返回成功；此时 JSON 事实源和 Markdown active view 可能短暂不一致。 | 失败会进入 cognitive error/trace，但没有自动修复队列。 |
 | STO-08 | 中 | 设计边界 | 为降低隐私风险，CodeY 不保存 Advisor 原始 prompt/response，只保存 hash 和结构化结果；因此事后无法逐字符重放或判断模型是否输出过被 validator 丢弃的其他内容。 | 可依赖 provider 日志或受控调试采样，但这又会引入新的隐私与保留风险。 |

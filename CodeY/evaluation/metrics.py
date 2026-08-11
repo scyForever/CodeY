@@ -1,19 +1,24 @@
 import json
 import tempfile
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from ..config import load_project_env, provider_env
 from .evaluator import run_fixed_benchmark
-from ..providers.clients import AnthropicCompatibleModelClient, FakeModelClient, OpenAICompatibleModelClient
+from ..providers.clients import (
+    AnthropicCompatibleModelClient,
+    FakeModelClient,
+    ModelCompletion,
+    OpenAICompatibleModelClient,
+)
 from ..core.runtime import CodeYAgent
 from ..storage.session import SessionStore
 from ..context.workspace import WorkspaceContext
 
 METRICS_SCHEMA_VERSION = 2
 DEFAULT_HARNESS_REGRESSION_V2_PATH = Path("artifacts/harness-regression-v2.json")
-DEFAULT_CONTEXT_ABLATION_V2_PATH = Path("artifacts/context-ablation-v2.json")
+DEFAULT_CONTEXT_ABLATION_V3_PATH = Path("artifacts/context-ablation-v3.json")
 DEFAULT_MEMORY_ABLATION_V2_PATH = Path("artifacts/memory-ablation-v2.json")
 DEFAULT_RECOVERY_ABLATION_V2_PATH = Path("artifacts/recovery-ablation-v2.json")
 DEFAULT_CORE_REPORT_PATH = Path("docs/metrics/codey-benchmark-core-report.md")
@@ -30,6 +35,10 @@ def _safe_ratio(numerator, denominator):
     if not denominator:
         return 0.0
     return numerator / denominator
+
+
+def _utc_timestamp():
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _parse_iso8601(value):
@@ -168,20 +177,41 @@ def _temporary_feature_flags(agent, updates):
         agent.feature_flags = previous
 
 
+@contextmanager
+def _temporary_context_budget(agent, *, unbounded=False):
+    manager = agent.context_manager
+    previous_total = manager.total_budget
+    previous_budgets = dict(manager.section_budgets)
+    if unbounded:
+        manager.total_budget = 10_000_000
+        manager.section_budgets = {
+            section: 10_000_000
+            for section in previous_budgets
+        }
+    try:
+        yield
+    finally:
+        manager.total_budget = previous_total
+        manager.section_budgets = previous_budgets
+
+
 def measure_feature_ablation_metrics(agent, user_message):
     variants = {
-        "full": {},
-        "no_context_reduction": {"context_reduction": False},
-        "no_memory": {"memory": False, "relevant_memory": False},
+        "budgeted": ({}, False),
+        "unbounded": ({}, True),
+        "no_memory": ({"memory": False, "relevant_memory": False}, False),
     }
     results = {}
-    for name, updates in variants.items():
-        with _temporary_feature_flags(agent, updates):
+    for name, (updates, unbounded) in variants.items():
+        with _temporary_feature_flags(agent, updates), _temporary_context_budget(
+            agent,
+            unbounded=unbounded,
+        ):
             prompt, metadata = agent._build_prompt_and_metadata(user_message)
         results[name] = {
             "prompt_chars": int(metadata.get("prompt_chars", 0)),
             "memory_chars": int(metadata.get("sections", {}).get("memory", {}).get("rendered_chars", 0)),
-            "history_chars": int(metadata.get("sections", {}).get("history", {}).get("rendered_chars", 0)),
+            "transcript_chars": int(metadata.get("sections", {}).get("transcript", {}).get("rendered_chars", 0)),
             "relevant_selected_count": int(metadata.get("relevant_memory", {}).get("selected_count", 0)),
             "budget_reduction_count": len(metadata.get("budget_reductions", [])),
             "current_request_preserved": prompt.endswith(f"Current user request:\n{user_message}"),
@@ -207,12 +237,21 @@ def build_stress_agent_metrics():
                 tags=("recall",),
                 created_at=f"2026-04-08T10:{index:02d}:00+00:00",
             )
-            agent.record(
+            agent.record_transcript(
                 {
-                    "role": "user" if index % 2 == 0 else "assistant",
+                    "role": "user",
                     "content": f"stress-history-{index}-" + ("B" * 220),
                     "created_at": f"2026-04-08T11:{index:02d}:00+00:00",
-                }
+                },
+                turn_id=f"stress-turn-{index:04d}",
+            )
+            agent.record_transcript(
+                {
+                    "role": "assistant",
+                    "content": f"stress-response-{index}-" + ("B" * 120),
+                    "created_at": f"2026-04-08T11:{index:02d}:30:00+00:00",
+                },
+                turn_id=f"stress-turn-{index:04d}",
             )
         return measure_feature_ablation_metrics(agent, "recall")
 
@@ -228,13 +267,15 @@ class _MemoryExperimentModelClient(FakeModelClient):
     def complete(self, prompt, max_new_tokens, **kwargs):
         del max_new_tokens, kwargs
         self.prompts.append(prompt)
-        self.last_completion_metadata = {}
         if self.phase == "bootstrap_tool":
             self.phase = "bootstrap_final"
-            return f'<tool>{{"name":"read_file","args":{{"path":"{self.filename}","start":1,"end":20}}}}</tool>'
+            return ModelCompletion(
+                text=f'<tool>{{"name":"read_file","args":{{"path":"{self.filename}","start":1,"end":20}}}}</tool>',
+                metadata={},
+            )
         if self.phase == "bootstrap_final":
             self.phase = "question"
-            return "<final>Done.</final>"
+            return ModelCompletion(text="<final>Done.</final>", metadata={})
         if self.phase == "question":
             prompt_lower = prompt.lower()
             memory_view = ""
@@ -244,14 +285,26 @@ class _MemoryExperimentModelClient(FakeModelClient):
             if "relevant memory:" in prompt_lower and "\n\ntranscript:" in prompt_lower:
                 relevant_view = prompt_lower.split("relevant memory:", 1)[1].split("\n\ntranscript:", 1)[0]
             if self.expected_fact in memory_view or self.expected_fact in relevant_view:
-                return f"<final>{self.expected_fact.capitalize()}.</final>"
+                return ModelCompletion(
+                    text=f"<final>{self.expected_fact.capitalize()}.</final>",
+                    metadata={},
+                )
             self.phase = "question_after_read"
             self.followup_reads += 1
-            return f'<tool>{{"name":"read_file","args":{{"path":"{self.filename}","start":1,"end":20}}}}</tool>'
+            return ModelCompletion(
+                text=f'<tool>{{"name":"read_file","args":{{"path":"{self.filename}","start":1,"end":20}}}}</tool>',
+                metadata={},
+            )
         if self.phase == "question_after_read":
             self.phase = "done"
-            return f"<final>{self.expected_fact.capitalize()}.</final>"
-        return f"<final>{self.expected_fact.capitalize()}.</final>"
+            return ModelCompletion(
+                text=f"<final>{self.expected_fact.capitalize()}.</final>",
+                metadata={},
+            )
+        return ModelCompletion(
+            text=f"<final>{self.expected_fact.capitalize()}.</final>",
+            metadata={},
+        )
 
 
 def _build_memory_experiment_agent(workspace_root, expected_fact, filename):
@@ -276,7 +329,6 @@ def _set_irrelevant_memory(agent):
             "note_index": 0,
         }
     ]
-    state["notes"] = ["team mascot is blue"]
     state["file_summaries"] = {}
     agent.memory.state = state
     agent.session["memory"] = agent.memory.to_dict()
@@ -373,7 +425,6 @@ def _set_irrelevant_memory_for_task(agent):
             "note_index": 0,
         }
     ]
-    state["notes"] = ["the team mascot is blue"]
     state["file_summaries"] = {}
     agent.memory.state = state
     agent.session["memory"] = agent.memory.to_dict()
@@ -438,12 +489,12 @@ def run_large_scale_memory_experiment(repetitions=5):
 
 def run_context_stress_matrix(repetitions=5):
     repetitions = int(repetitions)
-    history_levels = [("short", 4), ("medium", 12), ("long", 24)]
+    transcript_levels = [("short", 4), ("medium", 12), ("long", 24)]
     note_levels = [("low", 2), ("high", 10)]
     request_levels = [("short", "recall"), ("long", "recall the relevant benchmark fact without dropping the latest request details")]
     configs = []
 
-    for history_label, history_count in history_levels:
+    for transcript_label, turn_count in transcript_levels:
         for note_label, note_count in note_levels:
             for request_label, request_text in request_levels:
                 per_run = []
@@ -465,53 +516,63 @@ def run_context_stress_matrix(repetitions=5):
                                 tags=("recall",),
                                 created_at=f"2026-04-08T10:{index:02d}:00+00:00",
                             )
-                        for index in range(history_count):
-                            agent.record(
+                        for index in range(turn_count):
+                            turn_id = f"matrix-turn-{index:04d}"
+                            agent.record_transcript(
                                 {
-                                    "role": "user" if index % 2 == 0 else "assistant",
+                                    "role": "user",
                                     "content": f"matrix-history-{index}-" + ("B" * 220),
                                     "created_at": f"2026-04-08T11:{index:02d}:00+00:00",
-                                }
+                                },
+                                turn_id=turn_id,
+                            )
+                            agent.record_transcript(
+                                {
+                                    "role": "assistant",
+                                    "content": f"matrix-response-{index}-" + ("B" * 120),
+                                    "created_at": f"2026-04-08T11:{index:02d}:30+00:00",
+                                },
+                                turn_id=turn_id,
                             )
                         metrics = measure_feature_ablation_metrics(agent, request_text)
-                        full_chars = metrics["full"]["prompt_chars"]
-                        raw_chars = metrics["no_context_reduction"]["prompt_chars"]
-                        ratio = _safe_ratio(raw_chars - full_chars, raw_chars)
+                        budgeted_chars = metrics["budgeted"]["prompt_chars"]
+                        unbounded_chars = metrics["unbounded"]["prompt_chars"]
+                        ratio = _safe_ratio(unbounded_chars - budgeted_chars, unbounded_chars)
                         per_run.append(
                             {
-                                "full_prompt_chars": full_chars,
-                                "raw_prompt_chars": raw_chars,
-                                "compression_ratio": ratio,
-                                "current_request_preserved": bool(metrics["full"]["current_request_preserved"]),
+                                "budgeted_prompt_chars": budgeted_chars,
+                                "unbounded_prompt_chars": unbounded_chars,
+                                "budget_savings_ratio": ratio,
+                                "current_request_preserved": bool(metrics["budgeted"]["current_request_preserved"]),
                             }
                         )
                 configs.append(
                     {
-                        "id": f"{history_label}-{note_label}-{request_label}",
-                        "history_level": history_label,
+                        "id": f"{transcript_label}-{note_label}-{request_label}",
+                        "transcript_level": transcript_label,
                         "note_level": note_label,
                         "request_level": request_label,
-                        "avg_prompt_compression_ratio": _safe_mean(item["compression_ratio"] for item in per_run),
-                        "avg_full_prompt_chars": _safe_mean(item["full_prompt_chars"] for item in per_run),
-                        "avg_raw_prompt_chars": _safe_mean(item["raw_prompt_chars"] for item in per_run),
+                        "avg_prompt_budget_savings_ratio": _safe_mean(item["budget_savings_ratio"] for item in per_run),
+                        "avg_budgeted_prompt_chars": _safe_mean(item["budgeted_prompt_chars"] for item in per_run),
+                        "avg_unbounded_prompt_chars": _safe_mean(item["unbounded_prompt_chars"] for item in per_run),
                         "current_request_preserved_rate": _safe_ratio(
                             sum(1 for item in per_run if item["current_request_preserved"]),
                             len(per_run),
                         ),
                     }
                 )
-    ratios = [config["avg_prompt_compression_ratio"] for config in configs]
-    full_chars = [config["avg_full_prompt_chars"] for config in configs]
-    raw_chars = [config["avg_raw_prompt_chars"] for config in configs]
+    ratios = [config["avg_prompt_budget_savings_ratio"] for config in configs]
+    budgeted_chars = [config["avg_budgeted_prompt_chars"] for config in configs]
+    unbounded_chars = [config["avg_unbounded_prompt_chars"] for config in configs]
     return {
         "config_count": len(configs),
         "configs": configs,
         "summary": {
-            "avg_full_prompt_chars": _safe_mean(full_chars),
-            "avg_raw_prompt_chars": _safe_mean(raw_chars),
-            "avg_prompt_compression_ratio": _safe_mean(ratios),
-            "max_prompt_compression_ratio": max(ratios) if ratios else 0.0,
-            "min_prompt_compression_ratio": min(ratios) if ratios else 0.0,
+            "avg_budgeted_prompt_chars": _safe_mean(budgeted_chars),
+            "avg_unbounded_prompt_chars": _safe_mean(unbounded_chars),
+            "avg_prompt_budget_savings_ratio": _safe_mean(ratios),
+            "max_prompt_budget_savings_ratio": max(ratios) if ratios else 0.0,
+            "min_prompt_budget_savings_ratio": min(ratios) if ratios else 0.0,
             "current_request_preserved_rate": _safe_ratio(
                 sum(1 for config in configs if config["current_request_preserved_rate"] == 1.0),
                 len(configs),
@@ -558,12 +619,6 @@ def _scenario_empty_command(workspace_root):
     return dict(agent._last_tool_result_metadata)
 
 
-def _scenario_empty_delegate_task(workspace_root):
-    agent = _security_agent(workspace_root)
-    agent.run_tool("delegate", {"task": "", "max_steps": 2})
-    return dict(agent._last_tool_result_metadata)
-
-
 def _scenario_path_escape_read(workspace_root):
     outside = workspace_root.parent / f"{workspace_root.name}-outside.txt"
     outside.write_text("outside\n", encoding="utf-8")
@@ -603,9 +658,18 @@ def _scenario_repeated_call(workspace_root):
     (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
     agent = _security_agent(workspace_root)
     args = {"path": "README.md", "start": 1, "end": 1}
-    for _ in range(2):
+    for index in range(2):
         result = agent.run_tool("read_file", args)
-        agent.record({"role": "tool", "name": "read_file", "args": args, "content": result, "created_at": "2026-04-09T00:00:00+00:00"})
+        agent.record_transcript(
+            {
+                "role": "tool",
+                "name": "read_file",
+                "args": args,
+                "content": result,
+                "created_at": "2026-04-09T00:00:00+00:00",
+            },
+            turn_id=f"security-repeat-{index}",
+        )
     agent.run_tool("read_file", args)
     return dict(agent._last_tool_result_metadata)
 
@@ -620,7 +684,6 @@ SECURITY_SCENARIOS = [
     ("patch_nonunique", _scenario_invalid_patch_nonunique),
     ("patch_missing_new_text", _scenario_invalid_patch_missing_field),
     ("timeout_out_of_range", _scenario_timeout_out_of_range),
-    ("empty_delegate_task", _scenario_empty_delegate_task),
 ]
 
 
@@ -816,26 +879,30 @@ def _followup_trace_metrics(agent):
 
 def _inject_memory_noise(agent, rounds=8):
     for index in range(int(rounds)):
-        agent.record(
+        turn_id = f"memory-noise-{index:04d}"
+        agent.record_transcript(
             {
-                "role": "user" if index % 2 == 0 else "assistant",
+                "role": "user",
                 "content": f"filler-turn-{index}-" + ("context-noise-" * 40),
                 "created_at": f"2026-04-09T12:{index:02d}:00+00:00",
-            }
+            },
+            turn_id=turn_id,
+        )
+        agent.record_transcript(
+            {
+                "role": "assistant",
+                "content": f"filler-response-{index}-" + ("context-noise-" * 20),
+                "created_at": f"2026-04-09T12:{index:02d}:30:00+00:00",
+            },
+            turn_id=turn_id,
         )
 
 
 def _truncate_read_history(agent):
-    updated = []
-    for item in agent.session["history"]:
+    for item in agent.session["transcript"]["entries"]:
         if item.get("role") == "tool" and item.get("name") == "read_file":
-            replacement = dict(item)
-            replacement["content"] = f"# {item.get('args', {}).get('path', 'file')}\n(truncated from transcript)"
-            updated.append(replacement)
-        else:
-            updated.append(item)
-    agent.session["history"] = updated
-    agent.session_path = agent.session_store.save(agent.session)
+            item["content"] = f"# {item.get('args', {}).get('path', 'file')}\n(truncated from transcript)"
+    agent.save_session()
 
 
 def _build_real_agent(workspace_root, provider, approval_policy="auto", read_only=False):
@@ -919,20 +986,20 @@ def run_real_memory_experiment(provider="gpt", repetitions=1):
 def run_real_context_experiment(provider="gpt", repetitions=1):
     repetitions = int(repetitions)
     provider = str(provider)
-    history_levels = [("short", 4), ("medium", 12), ("long", 24)]
+    transcript_levels = [("short", 4), ("medium", 12), ("long", 24)]
     note_levels = [("low", 2), ("high", 10)]
     request_levels = [
         ("short", "Reply with the target token only."),
         ("long", "Reply with the target token only. Do not restate the prompt, and do not output any extra words."),
     ]
     configs = []
-    for history_label, history_count in history_levels:
+    for transcript_label, turn_count in transcript_levels:
         for note_label, note_count in note_levels:
             for request_label, request_text in request_levels:
-                token = f"TOKEN-{history_label}-{note_label}-{request_label}"
+                token = f"TOKEN-{transcript_label}-{note_label}-{request_label}"
                 per_run = []
                 for _ in range(repetitions):
-                    for variant_name, updates in (("full", {}), ("no_context_reduction", {"context_reduction": False})):
+                    for variant_name, unbounded in (("budgeted", False), ("unbounded", True)):
                         with tempfile.TemporaryDirectory(prefix="codey-real-context-") as temp_dir:
                             workspace_root = Path(temp_dir)
                             (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
@@ -940,15 +1007,25 @@ def run_real_context_experiment(provider="gpt", repetitions=1):
                             for index in range(note_count):
                                 note_text = f"target token is {token}" if index == 0 else f"decoy token is DECOY-{index}"
                                 agent.memory.append_note(note_text, tags=("token",), created_at=f"2026-04-09T10:{index:02d}:00+00:00")
-                            for index in range(history_count):
-                                agent.record(
+                            for index in range(turn_count):
+                                turn_id = f"real-context-turn-{index:04d}"
+                                agent.record_transcript(
                                     {
-                                        "role": "user" if index % 2 == 0 else "assistant",
+                                        "role": "user",
                                         "content": f"context-history-{index}-" + ("B" * 220),
                                         "created_at": f"2026-04-09T11:{index:02d}:00+00:00",
-                                    }
+                                    },
+                                    turn_id=turn_id,
                                 )
-                            with _temporary_feature_flags(agent, updates):
+                                agent.record_transcript(
+                                    {
+                                        "role": "assistant",
+                                        "content": f"context-response-{index}-" + ("B" * 120),
+                                        "created_at": f"2026-04-09T11:{index:02d}:30+00:00",
+                                    },
+                                    turn_id=turn_id,
+                                )
+                            with _temporary_context_budget(agent, unbounded=unbounded):
                                 answer = agent.ask(f"What is the target token remembered in the notes? {request_text}")
                             per_run.append(
                                 {
@@ -957,36 +1034,45 @@ def run_real_context_experiment(provider="gpt", repetitions=1):
                                     "correct": token.lower() in _normalize_text(answer),
                                 }
                             )
-                full_rows = [row for row in per_run if row["variant"] == "full"]
-                raw_rows = [row for row in per_run if row["variant"] == "no_context_reduction"]
-                avg_full = _safe_mean(row["prompt_chars"] for row in full_rows)
-                avg_raw = _safe_mean(row["prompt_chars"] for row in raw_rows)
+                budgeted_rows = [row for row in per_run if row["variant"] == "budgeted"]
+                unbounded_rows = [row for row in per_run if row["variant"] == "unbounded"]
+                avg_budgeted = _safe_mean(row["prompt_chars"] for row in budgeted_rows)
+                avg_unbounded = _safe_mean(row["prompt_chars"] for row in unbounded_rows)
                 configs.append(
                     {
-                        "id": f"{history_label}-{note_label}-{request_label}",
-                        "history_level": history_label,
+                        "id": f"{transcript_label}-{note_label}-{request_label}",
+                        "transcript_level": transcript_label,
                         "note_level": note_label,
                         "request_level": request_label,
-                        "avg_full_prompt_chars": avg_full,
-                        "avg_raw_prompt_chars": avg_raw,
-                        "avg_prompt_compression_ratio": _safe_ratio(avg_raw - avg_full, avg_raw),
-                        "full_correct_rate": _safe_ratio(sum(1 for row in full_rows if row["correct"]), len(full_rows)),
-                        "raw_correct_rate": _safe_ratio(sum(1 for row in raw_rows if row["correct"]), len(raw_rows)),
+                        "avg_budgeted_prompt_chars": avg_budgeted,
+                        "avg_unbounded_prompt_chars": avg_unbounded,
+                        "avg_prompt_budget_savings_ratio": _safe_ratio(
+                            avg_unbounded - avg_budgeted,
+                            avg_unbounded,
+                        ),
+                        "budgeted_correct_rate": _safe_ratio(
+                            sum(1 for row in budgeted_rows if row["correct"]),
+                            len(budgeted_rows),
+                        ),
+                        "unbounded_correct_rate": _safe_ratio(
+                            sum(1 for row in unbounded_rows if row["correct"]),
+                            len(unbounded_rows),
+                        ),
                     }
                 )
-    ratios = [config["avg_prompt_compression_ratio"] for config in configs]
-    full_chars = [config["avg_full_prompt_chars"] for config in configs]
-    raw_chars = [config["avg_raw_prompt_chars"] for config in configs]
+    ratios = [config["avg_prompt_budget_savings_ratio"] for config in configs]
+    budgeted_chars = [config["avg_budgeted_prompt_chars"] for config in configs]
+    unbounded_chars = [config["avg_unbounded_prompt_chars"] for config in configs]
     return {
         "provider": provider,
         "config_count": len(configs),
         "configs": configs,
         "summary": {
-            "avg_prompt_compression_ratio": _safe_mean(ratios),
-            "max_prompt_compression_ratio": max(ratios) if ratios else 0.0,
-            "min_prompt_compression_ratio": min(ratios) if ratios else 0.0,
-            "avg_full_prompt_chars": _safe_mean(full_chars),
-            "avg_raw_prompt_chars": _safe_mean(raw_chars),
+            "avg_prompt_budget_savings_ratio": _safe_mean(ratios),
+            "max_prompt_budget_savings_ratio": max(ratios) if ratios else 0.0,
+            "min_prompt_budget_savings_ratio": min(ratios) if ratios else 0.0,
+            "avg_budgeted_prompt_chars": _safe_mean(budgeted_chars),
+            "avg_unbounded_prompt_chars": _safe_mean(unbounded_chars),
         },
     }
 
@@ -1001,7 +1087,6 @@ REAL_SECURITY_SCENARIOS = [
     {"id": "patch_nonunique", "prompt": '<tool name="patch_file" path="sample.txt"><old_text>beta</old_text><new_text>locked</new_text></tool>', "approval_policy": "auto", "read_only": False},
     {"id": "patch_missing_new_text", "prompt": 'Respond with exactly this tool call and nothing else: <tool>{"name":"patch_file","args":{"path":"sample.txt","old_text":"beta"}}</tool>', "approval_policy": "auto", "read_only": False},
     {"id": "timeout_out_of_range", "prompt": 'Respond with exactly this tool call and nothing else: <tool>{"name":"run_shell","args":{"command":"echo hi","timeout":121}}</tool>', "approval_policy": "auto", "read_only": False},
-    {"id": "empty_delegate_task", "prompt": 'Respond with exactly this tool call and nothing else: <tool>{"name":"delegate","args":{"task":"","max_steps":2}}</tool>', "approval_policy": "auto", "read_only": False},
 ]
 
 
@@ -1101,8 +1186,8 @@ def collect_resume_metrics(
         context = run_real_context_experiment(provider=real_provider, repetitions=context_repetitions)
         security = run_real_security_experiment_suite(provider=real_provider, repetitions=security_repetitions)
         stress = {
-            "full": {"prompt_chars": int(round(context["summary"].get("avg_full_prompt_chars", 0.0)))},
-            "no_context_reduction": {"prompt_chars": int(round(context["summary"].get("avg_raw_prompt_chars", 0.0)))},
+            "budgeted": {"prompt_chars": int(round(context["summary"].get("avg_budgeted_prompt_chars", 0.0)))},
+            "unbounded": {"prompt_chars": int(round(context["summary"].get("avg_unbounded_prompt_chars", 0.0)))},
         }
     else:
         stress = build_stress_agent_metrics()
@@ -1134,10 +1219,10 @@ def collect_resume_metrics(
             f"Recorded 3 run artifacts per execution and structured runtime metadata across {runs['run_count']} aggregated runs.",
             f"Observed prompt-cache telemetry with average cached tokens of {runs['avg_cached_tokens']:.1f} and cache-hit rate of {runs['cache_hit_rate']:.2%} when available.",
             (
-                f"In a real-model long-context experiment ({real_provider}), context reduction shrank average prompt size from "
-                f"{stress['no_context_reduction']['prompt_chars']} to {stress['full']['prompt_chars']} chars."
+                f"In a real-model long-context experiment ({real_provider}), context budgeting reduced average prompt size from "
+                f"{stress['unbounded']['prompt_chars']} to {stress['budgeted']['prompt_chars']} chars."
                 if experiment_mode == "real"
-                else f"In a synthetic long-context stress scenario, context reduction shrank prompt size from {stress['no_context_reduction']['prompt_chars']} to {stress['full']['prompt_chars']} chars."
+                else f"In a synthetic long-context stress scenario, context budgeting reduced prompt size from {stress['unbounded']['prompt_chars']} to {stress['budgeted']['prompt_chars']} chars."
             ),
             f"In the memory dependency experiment, repeated follow-up reads dropped from {memory['memory_off']['repeated_reads']} to {memory['memory_on']['repeated_reads']}.",
             f"In the large-scale memory experiment, repeated reads dropped from {memory_large['variants']['memory_off']['repeated_reads']} to {memory_large['variants']['memory_on']['repeated_reads']} across {memory_large['task_count']} tasks.",
@@ -1168,9 +1253,9 @@ def render_resume_metrics_markdown(metrics):
         f"- Average attempts per run: {runs['avg_attempts']:.2f}",
         f"- Cache hit rate: {runs['cache_hit_rate']:.2%}",
         (
-            f"- Real-model prompt chars (full vs no context reduction): {stress['full']['prompt_chars']} / {stress['no_context_reduction']['prompt_chars']}"
+            f"- Real-model prompt chars (budgeted vs unbounded): {stress['budgeted']['prompt_chars']} / {stress['unbounded']['prompt_chars']}"
             if metrics.get("experiment_mode") == "real"
-            else f"- Synthetic prompt chars (full vs no context reduction): {stress['full']['prompt_chars']} / {stress['no_context_reduction']['prompt_chars']}"
+            else f"- Synthetic prompt chars (budgeted vs unbounded): {stress['budgeted']['prompt_chars']} / {stress['unbounded']['prompt_chars']}"
         ),
         f"- Memory repeated reads (on vs off): {memory['memory_on']['repeated_reads']} / {memory['memory_off']['repeated_reads']}",
         f"- Large-scale memory tasks: {memory_large['task_count']}",
@@ -1224,12 +1309,12 @@ def render_large_scale_experiment_report(metrics):
         "",
         "## Context Governance",
         (
-            f"- Real-model prompt chars ({report_provider}): {metrics['stress_ablation']['full']['prompt_chars']} vs {metrics['stress_ablation']['no_context_reduction']['prompt_chars']}"
+            f"- Real-model prompt chars ({report_provider}, budgeted vs unbounded): {metrics['stress_ablation']['budgeted']['prompt_chars']} vs {metrics['stress_ablation']['unbounded']['prompt_chars']}"
             if metrics.get("experiment_mode") == "real"
-            else f"- Synthetic stress prompt chars: {metrics['stress_ablation']['full']['prompt_chars']} vs {metrics['stress_ablation']['no_context_reduction']['prompt_chars']}"
+            else f"- Synthetic stress prompt chars (budgeted vs unbounded): {metrics['stress_ablation']['budgeted']['prompt_chars']} vs {metrics['stress_ablation']['unbounded']['prompt_chars']}"
         ),
-        f"- Average prompt compression ratio across context matrix: {context['summary']['avg_prompt_compression_ratio']:.2%}",
-        f"- Max prompt compression ratio across context matrix: {context['summary']['max_prompt_compression_ratio']:.2%}",
+        f"- Average prompt budget savings ratio across context matrix: {context['summary']['avg_prompt_budget_savings_ratio']:.2%}",
+        f"- Max prompt budget savings ratio across context matrix: {context['summary']['max_prompt_budget_savings_ratio']:.2%}",
         "",
         "## Memory Experiments",
         f"- Small memory experiment repeated reads: {memory_small['memory_on']['repeated_reads']} vs {memory_small['memory_off']['repeated_reads']}",
@@ -1256,7 +1341,7 @@ def render_large_scale_experiment_report(metrics):
         [
             "",
             "## Resume-Safe Claims",
-            f"- Long-context stress scenario: prompt length reduced from {metrics['stress_ablation']['no_context_reduction']['prompt_chars']} to {metrics['stress_ablation']['full']['prompt_chars']}.",
+            f"- Long-context stress scenario: budgeted prompt length was {metrics['stress_ablation']['budgeted']['prompt_chars']} vs {metrics['stress_ablation']['unbounded']['prompt_chars']} unbounded chars.",
             f"- Large-scale memory experiment: repeated reads reduced from {memory_large['variants']['memory_off']['repeated_reads']} to {memory_large['variants']['memory_on']['repeated_reads']}.",
             f"- Platform facts: {benchmark['task_count']} benchmark tasks, {metrics['facts']['tool_count']} tool types, {metrics['facts']['run_artifact_count']} run artifacts.",
             "",
@@ -1281,11 +1366,10 @@ class _RecoveryScenarioModelClient(FakeModelClient):
     def complete(self, prompt, max_new_tokens, **kwargs):
         del max_new_tokens, kwargs
         self.prompts.append(prompt)
-        self.last_completion_metadata = {}
         prompt_lower = str(prompt).lower()
         if all(fragment in prompt_lower for fragment in self.required_fragments):
-            return f"<final>{self.success_answer}</final>"
-        return "<final>missing recovery state.</final>"
+            return ModelCompletion(text=f"<final>{self.success_answer}</final>", metadata={})
+        return ModelCompletion(text="<final>missing recovery state.</final>", metadata={})
 
 
 RECOVERY_ABLATION_TASKS = [
@@ -1396,7 +1480,7 @@ def _apply_recovery_setup(agent, task, workspace_root):
         }
         if task["id"] == "checkpoint_resume_files":
             agent.session["checkpoints"]["items"]["ckpt_resume"]["key_files"] = [{"path": "sample.txt", "freshness": None}]
-        agent.session_store.save(agent.session)
+        agent.save_session()
         return
 
     if setup in {"partial_stale_single", "partial_stale_multi"}:
@@ -1432,7 +1516,7 @@ def _apply_recovery_setup(agent, task, workspace_root):
                 }
             },
         }
-        agent.session_store.save(agent.session)
+        agent.save_session()
         (workspace_root / "sample.txt").write_text("alpha\nbeta\nstale-shifted\nplaceholder\n", encoding="utf-8")
         if setup == "partial_stale_multi":
             (workspace_root / "notes.txt").write_text("note-one\nnote-two-shifted\n", encoding="utf-8")
@@ -1459,7 +1543,7 @@ def _apply_recovery_setup(agent, task, workspace_root):
                 }
             },
         }
-        agent.session_store.save(agent.session)
+        agent.save_session()
         return
 
     if setup == "schema_mismatch":
@@ -1483,12 +1567,12 @@ def _apply_recovery_setup(agent, task, workspace_root):
                 }
             },
         }
-        agent.session_store.save(agent.session)
+        agent.save_session()
         return
 
     if setup == "no_checkpoint":
-        agent.session.pop("checkpoints", None)
-        agent.session_store.save(agent.session)
+        agent.session["checkpoints"] = {"current_id": "", "items": {}}
+        agent.save_session()
         return
 
     if setup in {"partial_success_shell", "partial_success_tool"}:
@@ -1514,7 +1598,7 @@ def _apply_recovery_setup(agent, task, workspace_root):
                 }
             },
         }
-        agent.session_store.save(agent.session)
+        agent.save_session()
 
 
 def _run_recovery_task_variant(task, variant):
@@ -1524,8 +1608,8 @@ def _run_recovery_task_variant(task, variant):
         agent = _build_recovery_agent(workspace_root, task["required_fragments"])
         _apply_recovery_setup(agent, task, workspace_root)
         if variant == "resume_disabled":
-            agent.session.pop("checkpoints", None)
-            agent.session_store.save(agent.session)
+            agent.session["checkpoints"] = {"current_id": "", "items": {}}
+            agent.save_session()
         final_answer = agent.ask("Continue the recovery task.")
         report = agent.run_store.load_report(agent.current_task_state.run_id)
         trace = [
@@ -1565,12 +1649,12 @@ def _recovery_variant_summary(rows):
     }
 
 
-def run_context_ablation_v2(artifact_path=DEFAULT_CONTEXT_ABLATION_V2_PATH, repetitions=5):
+def run_context_ablation_v3(artifact_path=DEFAULT_CONTEXT_ABLATION_V3_PATH, repetitions=5):
     payload = run_context_stress_matrix(repetitions=repetitions)
     artifact = {
         "schema_version": METRICS_SCHEMA_VERSION,
-        "artifact_type": "context-ablation-v2",
-        "captured_at": datetime.utcnow().isoformat() + "Z",
+        "artifact_type": "context-ablation-v3",
+        "captured_at": _utc_timestamp(),
         "config_count": payload["config_count"],
         "configs": payload["configs"],
         "summary": payload["summary"],
@@ -1583,7 +1667,7 @@ def run_memory_ablation_v2(artifact_path=DEFAULT_MEMORY_ABLATION_V2_PATH, repeti
     artifact = {
         "schema_version": METRICS_SCHEMA_VERSION,
         "artifact_type": "memory-ablation-v2",
-        "captured_at": datetime.utcnow().isoformat() + "Z",
+        "captured_at": _utc_timestamp(),
         "task_count": payload["task_count"],
         "runs_per_variant": payload["runs_per_variant"],
         "category_counts": payload["category_counts"],
@@ -1603,7 +1687,7 @@ def run_recovery_ablation_v2(artifact_path=DEFAULT_RECOVERY_ABLATION_V2_PATH, re
     artifact = {
         "schema_version": METRICS_SCHEMA_VERSION,
         "artifact_type": "recovery-ablation-v2",
-        "captured_at": datetime.utcnow().isoformat() + "Z",
+        "captured_at": _utc_timestamp(),
         "task_count": len(RECOVERY_ABLATION_TASKS),
         "variants": {
             variant: {
@@ -1619,7 +1703,7 @@ def run_recovery_ablation_v2(artifact_path=DEFAULT_RECOVERY_ABLATION_V2_PATH, re
 def write_benchmark_core_report(
     report_path=DEFAULT_CORE_REPORT_PATH,
     harness_artifact_path=DEFAULT_HARNESS_REGRESSION_V2_PATH,
-    context_artifact_path=DEFAULT_CONTEXT_ABLATION_V2_PATH,
+    context_artifact_path=DEFAULT_CONTEXT_ABLATION_V3_PATH,
     memory_artifact_path=DEFAULT_MEMORY_ABLATION_V2_PATH,
     recovery_artifact_path=DEFAULT_RECOVERY_ABLATION_V2_PATH,
 ):
@@ -1642,10 +1726,10 @@ def write_benchmark_core_report(
         "",
         "## Context Ablation",
         f"- 配置数：{context['config_count']}",
-        f"- avg_full_prompt_chars：{context['summary']['avg_full_prompt_chars']:.2f}",
-        f"- avg_raw_prompt_chars：{context['summary']['avg_raw_prompt_chars']:.2f}",
-        f"- avg_prompt_compression_ratio：{context['summary']['avg_prompt_compression_ratio']:.2%}",
-        f"- max_prompt_compression_ratio：{context['summary']['max_prompt_compression_ratio']:.2%}",
+        f"- avg_budgeted_prompt_chars：{context['summary']['avg_budgeted_prompt_chars']:.2f}",
+        f"- avg_unbounded_prompt_chars：{context['summary']['avg_unbounded_prompt_chars']:.2f}",
+        f"- avg_prompt_budget_savings_ratio：{context['summary']['avg_prompt_budget_savings_ratio']:.2%}",
+        f"- max_prompt_budget_savings_ratio：{context['summary']['max_prompt_budget_savings_ratio']:.2%}",
         f"- current_request_preserved_rate：{context['summary']['current_request_preserved_rate']:.2%}",
         "",
         "## Working Memory Ablation",
@@ -1662,10 +1746,10 @@ def write_benchmark_core_report(
         f"- resume_false_accept_rate：{enabled_recovery['resume_false_accept_rate']:.2%}",
         "",
         "## 可以安全写进简历的指标",
-        "- avg_full_prompt_chars",
-        "- avg_raw_prompt_chars",
-        "- avg_prompt_compression_ratio",
-        "- max_prompt_compression_ratio",
+        "- avg_budgeted_prompt_chars",
+        "- avg_unbounded_prompt_chars",
+        "- avg_prompt_budget_savings_ratio",
+        "- max_prompt_budget_savings_ratio",
         "- repeated_reads",
         "- avg_tool_steps",
         "- correct_rate",

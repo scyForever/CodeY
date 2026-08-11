@@ -45,7 +45,7 @@ def current_runtime_identity(agent):
 
 
 def checkpoint_state(agent):
-    agent._ensure_session_shape()
+    agent._validate_session_schema()
     return agent.session["checkpoints"]
 
 
@@ -110,7 +110,7 @@ def evaluate_resume_state(agent):
 def render_checkpoint_text(agent):
     checkpoint = current_checkpoint(agent)
     if not checkpoint:
-        return ""
+        return "Resume state:\n- Resume status: no-checkpoint\n- Task checkpoint: none"
     lines = [
         "Task checkpoint:",
         f"- Resume status: {agent.resume_state.get('status', CHECKPOINT_NONE_STATUS)}",
@@ -171,5 +171,5 @@ def create_checkpoint(agent, task_state, user_message, trigger):
     state["current_id"] = checkpoint_id
     task_state.checkpoint_id = checkpoint_id
     agent.session["runtime_identity"] = checkpoint["runtime_identity"]
-    agent.session_path = agent.session_store.save(agent.session)
+    agent.save_session()
     return checkpoint

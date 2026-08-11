@@ -6,12 +6,15 @@
 """
 
 import argparse
+import json
 import os
+import shlex
 import shutil
 import sys
 import textwrap
 
 from .config import load_project_env, provider_env
+from .context.transcript import DEFAULT_RECENT_TURNS, DEFAULT_SUMMARY_MAX_CHARS
 from .providers.clients import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .core.runtime import CodeYAgent
 from .storage.session import SessionStore
@@ -47,8 +50,12 @@ HELP_DETAILS = textwrap.dedent(
     /help    Show this help message.
     /memory  Show the agent's distilled working memory.
     /route   Show discovered skills and the last selected route.
+    /feedback <correct|incorrect> [expected-skill|-] [note]
+             Record explicit feedback for the latest Skill routing event.
+    /description-patch <skill-name> [min-samples]
+             Build a review-required Description Patch from explicit feedback.
     /session Show the path to the saved session file.
-    /reset   Clear the current session history and memory.
+    /reset   Clear the current session transcript, summary, and memory.
     /exit    Exit the agent.
     """
 ).strip()
@@ -81,12 +88,12 @@ def _effective_provider(args):
     return provider
 
 
-def _effective_model(args, provider):
+def _effective_model(args, provider, explicit_model=None):
     # 模型选择优先级：
     # 1. 用户显式传入 --model
     # 2. provider 对应的环境变量
     # 3. 代码里的默认值
-    explicit_model = getattr(args, "model", None)
+    explicit_model = explicit_model or getattr(args, "model", None)
     if explicit_model:
         return explicit_model
     if provider == "openai":
@@ -120,12 +127,12 @@ def _configured_secret_names(args):
     return sorted(configured_secret_names)
 
 
-def _build_model_client(args):
+def _build_model_client(args, model_override=None):
     provider = _effective_provider(args)
     # CLI 只负责把 provider 选择翻译成具体 client。
     # 真正的提示词格式、缓存支持、HTTP 协议差异，都封装在 models.py 里。
     if provider == "openai":
-        model = _effective_model(args, provider)
+        model = _effective_model(args, provider, explicit_model=model_override)
         base_url = getattr(args, "base_url", None) or provider_env("CODEY_OPENAI_API_BASE", ("OPENAI_API_BASE",), DEFAULT_OPENAI_BASE_URL)
         api_key = provider_env(
             "CODEY_OPENAI_API_KEY",
@@ -139,7 +146,7 @@ def _build_model_client(args):
             timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
         )
     if provider == "anthropic":
-        model = _effective_model(args, provider)
+        model = _effective_model(args, provider, explicit_model=model_override)
         base_url = getattr(args, "base_url", None) or provider_env("CODEY_ANTHROPIC_API_BASE", ("ANTHROPIC_API_BASE",), DEFAULT_ANTHROPIC_BASE_URL)
         api_key = provider_env(
             "CODEY_ANTHROPIC_API_KEY",
@@ -153,7 +160,7 @@ def _build_model_client(args):
             timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
         )
     if provider == "deepseek":
-        model = _effective_model(args, provider)
+        model = _effective_model(args, provider, explicit_model=model_override)
         base_url = getattr(args, "base_url", None) or provider_env("CODEY_DEEPSEEK_API_BASE", ("DEEPSEEK_API_BASE",), DEFAULT_DEEPSEEK_BASE_URL)
         api_key = provider_env("CODEY_DEEPSEEK_API_KEY", ("DEEPSEEK_API_KEY",))
         return AnthropicCompatibleModelClient(
@@ -164,7 +171,7 @@ def _build_model_client(args):
             timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
         )
 
-    model = _effective_model(args, provider)
+    model = _effective_model(args, provider, explicit_model=model_override)
     host = getattr(args, "host", DEFAULT_OLLAMA_HOST)
     return OllamaModelClient(
         model=model,
@@ -242,7 +249,22 @@ def build_agent(args):
     load_project_env(workspace.repo_root)
     configured_secret_names = _configured_secret_names(args)
     store = SessionStore(workspace.repo_root + "/.codey/sessions")
-    model = _build_model_client(args)
+    def model_client_factory(_spec=None):
+        return _build_model_client(args)
+
+    model = model_client_factory()
+    summary_model_name = getattr(args, "summary_model", None)
+    selector_model_name = getattr(args, "skill_selector_model", None)
+    summary_model = (
+        _build_model_client(args, model_override=summary_model_name)
+        if summary_model_name
+        else None
+    )
+    skill_selector_model = (
+        _build_model_client(args, model_override=selector_model_name)
+        if selector_model_name
+        else None
+    )
     evolution_llm_config = {
         "mode": getattr(args, "evolution_mode", "rules"),
         "min_confidence": getattr(args, "evolution_llm_min_confidence", 0.75),
@@ -254,26 +276,44 @@ def build_agent(args):
     if session_id:
         return CodeYAgent.from_session(
             model_client=model,
+            model_client_factory=model_client_factory,
             workspace=workspace,
             session_store=store,
             session_id=session_id,
             approval_policy=args.approval,
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
+            skill_model_client=skill_selector_model,
+            skill_selection_max_new_tokens=getattr(args, "skill_selector_max_new_tokens", 256),
+            summary_model_client=summary_model,
+            summary_recent_turns=getattr(args, "summary_recent_turns", DEFAULT_RECENT_TURNS),
+            summary_max_new_tokens=getattr(args, "summary_max_new_tokens", 512),
+            summary_max_chars=getattr(args, "summary_max_chars", DEFAULT_SUMMARY_MAX_CHARS),
             secret_env_names=configured_secret_names,
             skill_mode=args.skill,
             evolution_llm_config=evolution_llm_config,
+            max_fork_branches=args.max_fork_branches,
+            max_parallel_branches=args.max_parallel_branches,
         )
     return CodeYAgent(
         model_client=model,
+        model_client_factory=model_client_factory,
         workspace=workspace,
         session_store=store,
         approval_policy=args.approval,
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
+        skill_model_client=skill_selector_model,
+        skill_selection_max_new_tokens=getattr(args, "skill_selector_max_new_tokens", 256),
+        summary_model_client=summary_model,
+        summary_recent_turns=getattr(args, "summary_recent_turns", DEFAULT_RECENT_TURNS),
+        summary_max_new_tokens=getattr(args, "summary_max_new_tokens", 512),
+        summary_max_chars=getattr(args, "summary_max_chars", DEFAULT_SUMMARY_MAX_CHARS),
         secret_env_names=configured_secret_names,
         skill_mode=args.skill,
         evolution_llm_config=evolution_llm_config,
+        max_fork_branches=args.max_fork_branches,
+        max_parallel_branches=args.max_parallel_branches,
     )
 
 
@@ -301,6 +341,46 @@ def build_arg_parser():
     parser.add_argument("--openai-timeout", type=int, default=300, help="OpenAI-compatible request timeout in seconds.")
     parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")
     parser.add_argument("--skill", default="auto", metavar="auto|off|PATH", help="Discover project skills, disable them, or load one explicit skill path.")
+    parser.add_argument(
+        "--skill-selector-model",
+        default=None,
+        help="Optional model override for Description-based Skill selection; uses the main provider.",
+    )
+    parser.add_argument(
+        "--skill-selector-max-new-tokens",
+        type=int,
+        default=256,
+        help="Maximum output tokens for one Description-based Skill selection call.",
+    )
+    parser.add_argument(
+        "--summary-model",
+        default=None,
+        help="Optional model override for asynchronous conversation summaries; uses the main provider.",
+    )
+    parser.add_argument(
+        "--summary-recent-turns",
+        type=int,
+        default=DEFAULT_RECENT_TURNS,
+        help="Number of completed turns kept verbatim outside the committed summary.",
+    )
+    parser.add_argument(
+        "--summary-max-new-tokens",
+        type=int,
+        default=512,
+        help="Maximum output tokens for one asynchronous summary refresh.",
+    )
+    parser.add_argument(
+        "--summary-max-chars",
+        type=int,
+        default=DEFAULT_SUMMARY_MAX_CHARS,
+        help="Maximum accepted characters in a committed conversation summary.",
+    )
+    parser.add_argument(
+        "--summary-flush-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for asynchronous summaries before CLI exit.",
+    )
     parser.add_argument("--approval", choices=("ask", "auto", "never"), default="ask", help="Approval policy for risky tools.")
     parser.add_argument(
         "--secret-env-name",
@@ -310,6 +390,18 @@ def build_arg_parser():
         help="Extra environment variable names to treat as secrets for trace/report redaction.",
     )
     parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
+    parser.add_argument(
+        "--max-fork-branches",
+        type=int,
+        default=4,
+        help="Maximum homogeneous child agents in one fork_join call.",
+    )
+    parser.add_argument(
+        "--max-parallel-branches",
+        type=int,
+        default=4,
+        help="Maximum fork_join child agents executing concurrently.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
     parser.add_argument(
         "--evolution-mode",
@@ -334,6 +426,44 @@ def build_arg_parser():
     return parser
 
 
+def submit_route_feedback_command(agent, command):
+    parts = shlex.split(str(command))
+    if len(parts) < 2 or parts[0] != "/feedback":
+        raise ValueError(
+            "usage: /feedback <correct|incorrect> [expected-skill|-] [note]"
+        )
+    verdict = parts[1].casefold()
+    if verdict not in {"correct", "incorrect"}:
+        raise ValueError("feedback verdict must be 'correct' or 'incorrect'")
+    expected = "" if len(parts) < 3 or parts[2] == "-" else parts[2]
+    note = " ".join(parts[3:])
+    event = agent.submit_skill_feedback(
+        verdict == "correct",
+        expected_skill_name=expected,
+        note=note,
+    )
+    return {
+        "event_id": event["event_id"],
+        "verdict": "positive" if verdict == "correct" else "negative",
+        "expected_skill_name": expected,
+    }
+
+
+def propose_description_patch_command(agent, command):
+    parts = shlex.split(str(command))
+    if len(parts) not in {2, 3} or parts[0] != "/description-patch":
+        raise ValueError("usage: /description-patch <skill-name> [min-samples]")
+    min_samples = 3
+    if len(parts) == 3:
+        try:
+            min_samples = int(parts[2])
+        except ValueError as exc:
+            raise ValueError("min-samples must be an integer") from exc
+        if min_samples < 1:
+            raise ValueError("min-samples must be at least 1")
+    return agent.propose_skill_description_patch(parts[1], min_samples=min_samples)
+
+
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     agent = build_agent(args)
@@ -342,51 +472,70 @@ def main(argv=None):
     host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", DEFAULT_OLLAMA_HOST)))
     print(build_welcome(agent, model=model, host=host))
 
-    if args.prompt:
-        # one-shot 模式：只跑一次 ask，不进入 REPL 循环。
-        prompt = " ".join(args.prompt).strip()
-        if prompt:
+    try:
+        if args.prompt:
+            # one-shot 模式：只跑一次 ask，不进入 REPL 循环。
+            prompt = " ".join(args.prompt).strip()
+            if prompt:
+                print()
+                try:
+                    print(agent.ask(prompt))
+                except RuntimeError as exc:
+                    print(str(exc), file=sys.stderr)
+                    return 1
+            return 0
+
+        while True:
+            # 交互模式：每次读取一条用户输入，交给同一个 agent，
+            # 因此 session transcript 和 working memory 会跨轮延续。
+            try:
+                user_input = input("\ncodey> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("")
+                return 0
+
+            if not user_input:
+                continue
+            if user_input in {"/exit", "/quit"}:
+                return 0
+            if user_input == "/help":
+                print(HELP_DETAILS)
+                continue
+            if user_input == "/memory":
+                print(agent.memory_text())
+                continue
+            if user_input == "/route":
+                print(json.dumps(agent.route_status(), indent=2, ensure_ascii=False))
+                continue
+            if user_input == "/feedback" or user_input.startswith("/feedback "):
+                try:
+                    payload = submit_route_feedback_command(agent, user_input)
+                    print(json.dumps(payload, indent=2, ensure_ascii=False))
+                except (TypeError, ValueError) as exc:
+                    print(f"feedback error: {exc}", file=sys.stderr)
+                continue
+            if user_input == "/description-patch" or user_input.startswith(
+                "/description-patch "
+            ):
+                try:
+                    payload = propose_description_patch_command(agent, user_input)
+                    print(json.dumps(payload, indent=2, ensure_ascii=False))
+                except (TypeError, ValueError) as exc:
+                    print(f"description patch error: {exc}", file=sys.stderr)
+                continue
+            if user_input == "/session":
+                print(agent.session_path)
+                continue
+            if user_input == "/reset":
+                agent.reset()
+                print("session reset")
+                continue
+
             print()
             try:
-                print(agent.ask(prompt))
+                print(agent.ask(user_input))
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
-                return 1
-        return 0
-
-    while True:
-        # 交互模式：每次读取一条用户输入，交给同一个 agent，
-        # 因此 session history 和 working memory 会跨轮延续。
-        try:
-            user_input = input("\ncodey> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("")
-            return 0
-
-        if not user_input:
-            continue
-        if user_input in {"/exit", "/quit"}:
-            return 0
-        if user_input == "/help":
-            print(HELP_DETAILS)
-            continue
-        if user_input == "/memory":
-            print(agent.memory_text())
-            continue
-        if user_input == "/route":
-            import json
-            print(json.dumps(agent.route_status(), indent=2, ensure_ascii=False))
-            continue
-        if user_input == "/session":
-            print(agent.session_path)
-            continue
-        if user_input == "/reset":
-            agent.reset()
-            print("session reset")
-            continue
-
-        print()
-        try:
-            print(agent.ask(user_input))
-        except RuntimeError as exc:
-            print(str(exc), file=sys.stderr)
+    finally:
+        if not agent.close(args.summary_flush_timeout):
+            print("warning: asynchronous conversation summary did not finish before exit", file=sys.stderr)

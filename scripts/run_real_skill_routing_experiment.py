@@ -67,6 +67,7 @@ def build_arg_parser():
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--seed", type=int, default=20260712)
     parser.add_argument("--provider", choices=("openai", "anthropic", "deepseek"))
+    parser.add_argument("--model", default=None, help="Explicit model override for the selected provider.")
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--transport-attempts", type=int, default=1)
     parser.add_argument("--delay-seconds", type=float, default=3.0)
@@ -180,6 +181,7 @@ def main(argv=None):
         client, provider = build_external_model_client(
             ROOT,
             provider=args.provider,
+            model_override=args.model,
             timeout=args.timeout,
             transport_attempts=args.transport_attempts,
         )

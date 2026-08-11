@@ -8,14 +8,28 @@ import json
 import hashlib
 import os
 import re
+import threading
 import uuid
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
 from ..storage import checkpoint as checkpointlib
 from ..memory import store as memorylib
+from ..providers.clients import normalize_model_completion
 from ..tools import security as securitylib
 from ..context.manager import ContextManager
+from ..context.transcript import (
+    AsyncConversationSummarizer,
+    DEFAULT_RECENT_TURNS,
+    append_transcript_entry,
+    new_summary_state,
+    new_transcript_state,
+    render_transcript_entries,
+    validate_summary_against_transcript,
+    validate_summary_state,
+    validate_transcript_state,
+)
 from ..evolution import CognitiveLoop
 from ..storage.checkpoint import CHECKPOINT_NONE_STATUS
 from ..context.prompt_prefix import build_prompt_prefix, tool_signature
@@ -25,18 +39,20 @@ from ..storage.session import SessionStore
 from ..tools.context import ToolContext
 from ..tools.executor import ToolExecutor
 from ..tools import registry as toolkit
-from ..context.workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
+from ..context.workspace import IGNORED_PATH_NAMES, MAX_TRANSCRIPT_CHARS, WorkspaceContext, clip, now
 from ..skills.hooks import HookManager
-from ..skills.router import RouteMatch, SkillRouter
+from ..skills.feedback import SkillFeedbackStore
+from ..skills.router import RouteMatch, SkillRouter, SkillSelection
 
 DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
 DEFAULT_FEATURE_FLAGS = {
     "memory": True,
     "relevant_memory": True,
-    "context_reduction": True,
     "prompt_cache": True,
     "self_evolution": True,
 }
+SESSION_SCHEMA_VERSION = 2
+FORK_SCHEMA_VERSION = "fork-v2"
 DURABLE_MEMORY_INTENT_PATTERN = re.compile(r"(?i)\b(capture|remember|save|store|persist|note)\b")
 DURABLE_MEMORY_INTENT_ZH_PATTERN = re.compile(r"(记住|保存|记录|沉淀|长期记忆|持久记忆)")
 DURABLE_MEMORY_LINE_PATTERNS = (
@@ -77,8 +93,43 @@ class CodeYAgent:
         evolution_thresholds=None,
         evolution_llm_config=None,
         evolution_llm_client=None,
+        skill_model_client=None,
+        skill_selection_max_new_tokens=256,
+        summary_model_client=None,
+        summary_recent_turns=DEFAULT_RECENT_TURNS,
+        summary_max_new_tokens=512,
+        summary_max_chars=4000,
+        model_client_factory=None,
+        model_client_lock=None,
+        graph_checkpointer=None,
+        max_fork_branches=4,
+        max_parallel_branches=4,
+        allow_persistent_graph_checkpointer=False,
+        parent_run_id="",
+        fork_id="",
+        branch_id="",
+        graph_thread_id="",
     ):
         self.model_client = model_client
+        self.skill_model_client = skill_model_client if skill_model_client is not None else model_client
+        self.skill_selection_max_new_tokens = max(64, int(skill_selection_max_new_tokens))
+        self.summary_model_client = summary_model_client if summary_model_client is not None else model_client
+        self.summary_max_new_tokens = max(64, int(summary_max_new_tokens))
+        self.model_client_factory = model_client_factory
+        self._model_client_lock = model_client_lock or threading.RLock()
+        self._skill_model_client_lock = (
+            self._model_client_lock
+            if self.skill_model_client is self.model_client
+            else threading.RLock()
+        )
+        self._summary_model_client_lock = (
+            self._model_client_lock
+            if self.summary_model_client is self.model_client
+            else threading.RLock()
+        )
+        self._session_lock = threading.RLock()
+        self.graph_checkpointer = graph_checkpointer
+        self.allow_persistent_graph_checkpointer = bool(allow_persistent_graph_checkpointer)
         self.workspace = workspace
         self.root = Path(workspace.repo_root)
         self.session_store = session_store
@@ -87,6 +138,12 @@ class CodeYAgent:
         self.max_new_tokens = max_new_tokens
         self.depth = depth
         self.max_depth = max_depth
+        self.max_fork_branches = max(2, int(max_fork_branches))
+        self.max_parallel_branches = max(1, min(int(max_parallel_branches), self.max_fork_branches))
+        self.parent_run_id = str(parent_run_id or "")
+        self.fork_id = str(fork_id or "")
+        self.branch_id = str(branch_id or "")
+        self.graph_thread_id = str(graph_thread_id or "")
         self.read_only = read_only
         self.shell_env_allowlist = tuple(shell_env_allowlist or DEFAULT_SHELL_ENV_ALLOWLIST)
         self.secret_env_names = {str(name).upper() for name in (secret_env_names or ())}
@@ -96,6 +153,7 @@ class CodeYAgent:
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
         self.skill_mode = str(skill_mode or "auto")
         self.skill_router = SkillRouter(self.root, mode=self.skill_mode)
+        self.skill_feedback_store = SkillFeedbackStore(self.root / ".codey" / "skill-routing")
         self.hook_manager = HookManager(hook_callbacks)
         self.current_route = RouteMatch()
         self._compact_hook_run_id = ""
@@ -106,18 +164,12 @@ class CodeYAgent:
             llm_client=evolution_llm_client if evolution_llm_client is not None else model_client,
             llm_config=evolution_llm_config,
         )
-        self.session = session or {
-            "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
-            "created_at": now(),
-            "workspace_root": workspace.repo_root,
-            "history": [],
-            "memory": memorylib.default_memory_state(),
-        }
-        self._ensure_session_shape()
+        self.session = session if session is not None else self._new_session()
+        self._validate_session_schema()
         start_reason = "resume" if session is not None else "startup"
         self.hook_manager.session_start(self, start_reason)
         self.memory = memorylib.LayeredMemory(
-            self.session.setdefault("memory", memorylib.default_memory_state()),
+            self.session["memory"],
             workspace_root=self.root,
         )
         self.session["memory"] = self.memory.to_dict()
@@ -126,12 +178,18 @@ class CodeYAgent:
         self.prefix_state = self.build_prefix()
         self.prefix = self.prefix_state.text
         self.context_manager = ContextManager(self)
+        self.conversation_summarizer = AsyncConversationSummarizer(
+            self,
+            recent_turns=summary_recent_turns,
+            max_chars=summary_max_chars,
+        )
+        if session is not None:
+            self.conversation_summarizer.recover_persisted_pending()
         self.resume_state = self.evaluate_resume_state()
-        self.session_path = self.session_store.save(self.session)
+        self.session_path = self.save_session()
         self.current_task_state = None
         self.current_run_dir = None
         self.last_prompt_metadata = {}
-        self.last_completion_metadata = {}
         self.last_durable_promotions = []
         self.last_durable_rejections = []
         self.last_durable_superseded = []
@@ -143,6 +201,9 @@ class CodeYAgent:
             "workspace_changed": False,
             "prefix_changed": False,
         }
+        self._ask_lock = threading.Lock()
+        self._used_graph_thread_ids = set()
+        self._active_turn_id = ""
 
     @classmethod
     def from_session(cls, model_client, workspace, session_store, session_id, **kwargs):
@@ -154,24 +215,84 @@ class CodeYAgent:
             **kwargs,
         )
 
-    def _ensure_session_shape(self):
-        self.session.setdefault("history", [])
-        self.session.setdefault("memory", memorylib.default_memory_state())
-        checkpoints = self.session.setdefault("checkpoints", {})
-        if not isinstance(checkpoints, dict):
-            checkpoints = {}
-            self.session["checkpoints"] = checkpoints
-        checkpoints.setdefault("current_id", "")
-        checkpoints.setdefault("items", {})
-        runtime_identity = self.session.setdefault("runtime_identity", {})
-        if not isinstance(runtime_identity, dict):
-            self.session["runtime_identity"] = {}
-        resume_state = self.session.setdefault("resume_state", {})
-        if not isinstance(resume_state, dict):
-            self.session["resume_state"] = {}
-        session_context = self.session.setdefault("session_context", {})
-        if not isinstance(session_context, dict):
-            self.session["session_context"] = {}
+    def _new_session(self):
+        return {
+            "schema_version": SESSION_SCHEMA_VERSION,
+            "revision": 0,
+            "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
+            "created_at": now(),
+            "workspace_root": str(self.workspace.repo_root),
+            "transcript": new_transcript_state(),
+            "conversation_summary": new_summary_state(),
+            "memory": memorylib.default_memory_state(),
+            "checkpoints": {"items": {}, "current_id": ""},
+            "runtime_identity": {},
+            "resume_state": {},
+            "session_context": {},
+            "forks": {"schema_version": FORK_SCHEMA_VERSION, "items": {}},
+        }
+
+    def _validate_session_schema(self):
+        required = {
+            "schema_version",
+            "revision",
+            "id",
+            "created_at",
+            "workspace_root",
+            "transcript",
+            "conversation_summary",
+            "memory",
+            "checkpoints",
+            "runtime_identity",
+            "resume_state",
+            "session_context",
+            "forks",
+        }
+        if not isinstance(self.session, dict) or self.session.get("schema_version") != SESSION_SCHEMA_VERSION:
+            raise ValueError(
+                f"session schema_version must be {SESSION_SCHEMA_VERSION}; legacy sessions are not supported"
+            )
+        if set(self.session) != required:
+            raise ValueError("session has unknown or missing fields")
+        if not isinstance(self.session["revision"], int) or self.session["revision"] < 0:
+            raise ValueError("session revision is invalid")
+        for key in ("id", "created_at", "workspace_root"):
+            if not isinstance(self.session[key], str) or not self.session[key]:
+                raise ValueError(f"session {key} is invalid")
+        validate_transcript_state(self.session["transcript"])
+        validate_summary_state(self.session["conversation_summary"])
+        validate_summary_against_transcript(
+            self.session["conversation_summary"],
+            self.session["transcript"]["entries"],
+        )
+        memorylib.normalize_memory_state(self.session["memory"], self.root)
+        checkpoints = self.session["checkpoints"]
+        if not isinstance(checkpoints, dict) or set(checkpoints) != {"items", "current_id"}:
+            raise ValueError("session checkpoints state is invalid")
+        if not isinstance(checkpoints["items"], dict) or any(
+            not isinstance(value, dict) for value in checkpoints["items"].values()
+        ):
+            raise ValueError("session checkpoint items are invalid")
+        current_id = checkpoints["current_id"]
+        if not isinstance(current_id, str) or (current_id and current_id not in checkpoints["items"]):
+            raise ValueError("session current checkpoint is invalid")
+        for key in ("runtime_identity", "resume_state", "session_context"):
+            if not isinstance(self.session[key], dict):
+                raise ValueError(f"session {key} must be an object")
+        forks = self.session["forks"]
+        if (
+            not isinstance(forks, dict)
+            or set(forks) != {"schema_version", "items"}
+            or forks["schema_version"] != FORK_SCHEMA_VERSION
+            or not isinstance(forks["items"], dict)
+        ):
+            raise ValueError("session forks state is invalid")
+        return self.session
+
+    def save_session(self):
+        self._validate_session_schema()
+        self.session_path = self.session_store.save(self.session)
+        return self.session_path
 
     def current_runtime_identity(self):
         return checkpointlib.current_runtime_identity(self)
@@ -240,9 +361,61 @@ class CodeYAgent:
             skill_fingerprint=str(context.get("skill_fingerprint", "")),
         )
 
-    def route_task(self, user_message):
-        self.current_route = self.skill_router.route(user_message)
+    def route_task(self, user_message, *, run_id, task_id):
+        route = self.skill_router.route(
+            user_message,
+            selector=self.select_skill_from_descriptions,
+        )
+        event_id = self.skill_feedback_store.start(
+            session_id=self.session["id"],
+            run_id=run_id,
+            task_id=task_id,
+            request=self.redact_text(user_message),
+            route=route.to_dict(),
+        )
+        self.current_route = replace(route, routing_event_id=event_id)
         return self.current_route
+
+    def select_skill_from_descriptions(self, request, skills, candidates):
+        catalog = [
+            {
+                "skill_name": skill.name,
+                "description": skill.description,
+                "activation_phrases": list(skill.activation_phrases),
+                "near_misses": list(skill.near_misses),
+                "lexical_evidence": next(
+                    candidate.to_dict()
+                    for candidate in candidates
+                    if candidate.skill_name == skill.name
+                ),
+            }
+            for skill in skills
+        ]
+        prompt = (
+            "Select at most one project Skill for the user request. Use each Description as the "
+            "activation boundary and respect its near-miss exclusions. Return exactly one JSON "
+            "object with keys skill_name, confidence, and reason. Use an empty skill_name when no "
+            "Skill applies.\n\n"
+            f"Request:\n{request}\n\n"
+            "Skill catalog:\n"
+            + json.dumps(catalog, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+        with self._skill_model_client_lock:
+            completion = normalize_model_completion(
+                self.skill_model_client.complete(prompt, self.skill_selection_max_new_tokens)
+            )
+        try:
+            payload = json.loads(completion.text.strip())
+        except json.JSONDecodeError as exc:
+            raise ValueError("skill selector output must be strict JSON") from exc
+        if not isinstance(payload, dict) or set(payload) != {"skill_name", "confidence", "reason"}:
+            raise ValueError("skill selector output has invalid fields")
+        return SkillSelection(
+            skill_name=str(payload["skill_name"] or "").strip(),
+            confidence=float(payload["confidence"]),
+            reason=str(payload["reason"] or "").strip(),
+            source="description_model",
+        )
 
     def route_context_text(self):
         return self.current_route.route_context
@@ -250,11 +423,52 @@ class CodeYAgent:
     def route_status(self):
         return self.skill_router.status(self.current_route)
 
+    def complete_skill_routing_feedback(self, task_state):
+        event_id = str(getattr(task_state, "routing_event_id", "") or "")
+        if not event_id:
+            return None
+        outcome = str(
+            self.last_cognitive_loop.get("outcome", {}).get("label", "")
+            or ("correct" if task_state.status == "completed" else "incorrect")
+        )
+        return self.skill_feedback_store.complete(
+            event_id,
+            status=task_state.status,
+            stop_reason=task_state.stop_reason,
+            outcome=outcome,
+            tool_steps=task_state.tool_steps,
+        )
+
+    def submit_skill_feedback(self, correct, expected_skill_name="", note="", event_id=""):
+        if not isinstance(correct, bool):
+            raise TypeError("correct must be a boolean")
+        expected_skill_name = str(expected_skill_name).strip()
+        if expected_skill_name and expected_skill_name.casefold() not in {
+            skill.name.casefold()
+            for skill in self.skill_router.skills
+        }:
+            raise ValueError(f"unknown expected Skill: {expected_skill_name}")
+        resolved = str(event_id or getattr(self.current_task_state, "routing_event_id", "") or "")
+        if not resolved:
+            raise ValueError("no Skill routing event is available")
+        return self.skill_feedback_store.submit_user_feedback(
+            resolved,
+            correct=correct,
+            expected_skill_name=expected_skill_name,
+            note=note,
+        )
+
+    def propose_skill_description_patch(self, skill_name, min_samples=3):
+        return self.skill_feedback_store.propose_description_patch(
+            skill_name,
+            min_samples=min_samples,
+        )
+
     def restore_session_context(self, reason):
         payload = self.hook_manager.session_start(self, reason)
         if hasattr(self, "tools"):
             self._apply_prefix_state(self.build_prefix())
-        self.session_path = self.session_store.save(self.session)
+        self.save_session()
         return payload
 
     def compact_session_context(self, run_id):
@@ -356,31 +570,33 @@ class CodeYAgent:
         """Activate one human-reviewed patch and refresh its knowledge view."""
         return self.cognitive_loop.approve_patch(patch_id)
 
-    def history_text(self):
-        history = self.session["history"]
-        if not history:
+    def transcript_entries(self):
+        return list(self.session["transcript"]["entries"])
+
+    def transcript_text(self):
+        entries = self.transcript_entries()
+        if not entries:
             return "- empty"
+        return clip(render_transcript_entries(entries), MAX_TRANSCRIPT_CHARS)
 
-        lines = []
-        seen_reads = set()
-        recent_start = max(0, len(history) - 6)
-        for index, item in enumerate(history):
-            recent = index >= recent_start
-            if item["role"] == "tool" and item["name"] == "read_file" and not recent:
-                path = str(item["args"].get("path", ""))
-                if path in seen_reads:
-                    continue
-                seen_reads.add(path)
+    def conversation_summary_state(self):
+        return self.session["conversation_summary"]
 
-            if item["role"] == "tool":
-                limit = 900 if recent else 180
-                lines.append(f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}")
-                lines.append(clip(item["content"], limit))
-            else:
-                limit = 900 if recent else 220
-                lines.append(f"[{item['role']}] {clip(item['content'], limit)}")
+    def conversation_summary_text(self):
+        return str(self.conversation_summary_state()["committed"]["text"])
 
-        return clip("\n".join(lines), MAX_HISTORY)
+    def refresh_conversation_summary_async(self):
+        return self.conversation_summarizer.schedule()
+
+    def wait_for_conversation_summary(self, timeout=None):
+        return self.conversation_summarizer.wait(timeout)
+
+    def close(self, timeout=30.0):
+        """Wait for asynchronous summary work, cancelling pending state on timeout."""
+        completed = self.wait_for_conversation_summary(timeout)
+        if not completed:
+            self.conversation_summarizer.cancel_pending("SummaryFlushTimeout")
+        return completed
 
     def feature_enabled(self, name):
         return bool(self.feature_flags.get(str(name), False))
@@ -389,9 +605,14 @@ class CodeYAgent:
         prompt, _ = self._build_prompt_and_metadata(user_message)
         return prompt
 
-    def record(self, item):
-        self.session["history"].append(item)
-        self.session_path = self.session_store.save(self.session)
+    def record_transcript(self, item, turn_id=None):
+        with self._session_lock:
+            resolved_turn_id = str(turn_id or self._active_turn_id or "").strip()
+            if not resolved_turn_id:
+                raise ValueError("manual transcript entries require an explicit turn_id")
+            entry = append_transcript_entry(self.session["transcript"], item, resolved_turn_id)
+            self.save_session()
+            return dict(entry)
 
     @staticmethod
     def looks_sensitive_env_name(name):
@@ -436,7 +657,15 @@ class CodeYAgent:
                 "prefix_chars": len(self.prefix),
                 "workspace_chars": len(self.workspace.text()),
                 "memory_chars": len(self.memory_text()),
-                "history_chars": len(self.history_text()),
+                "transcript_chars": len(self.transcript_text()),
+                "conversation_summary": {
+                    "committed_generation": self.conversation_summary_state()["committed"]["generation"],
+                    "covered_through_sequence": self.conversation_summary_state()["committed"]["covered_through_sequence"],
+                    "pending_generation": int(
+                        (self.conversation_summary_state().get("pending") or {}).get("generation", 0)
+                    ),
+                    "last_error": dict(self.conversation_summary_state().get("last_error") or {}),
+                },
                 "request_chars": len(user_message),
                 "tool_count": len(self.tools),
                 "workspace_docs": len(self.workspace.project_docs),
@@ -512,7 +741,7 @@ class CodeYAgent:
 
         为什么存在：
         并不是每个工具结果都值得长期带进下一轮 prompt。完整结果已经进了
-        `history`，这里只挑少量“下一轮大概率还会用到”的事实做提纯，
+        `transcript`，这里只挑少量“下一轮大概率还会用到”的事实做提纯，
         例如最近读写过哪些文件、某个文件读出来的短摘要。
 
         输入 / 输出：
@@ -521,7 +750,7 @@ class CodeYAgent:
 
         在 agent 链路里的位置：
         它发生在 `run_tool()` 真正执行完工具之后、下一轮 prompt 组装之前。
-        也就是说：工具结果先进入完整历史，再由这个函数择优沉淀成轻量记忆。
+        也就是说：工具结果先进入完整 transcript，再由这个函数择优沉淀成轻量记忆。
         """
         if not self.feature_enabled("memory"):
             return
@@ -624,10 +853,39 @@ class CodeYAgent:
         self.last_durable_superseded = superseded
         return promoted, rejections, superseded
 
-    def ask(self, user_message):
+    def ask(self, user_message, *, thread_id=None):
         from .agent_loop import AgentLoop
 
-        return AgentLoop(self).run(user_message)
+        requested_thread_id = str(thread_id or "")
+        with self._ask_lock:
+            if requested_thread_id and requested_thread_id in self._used_graph_thread_ids:
+                raise ValueError("graph thread_id must be unique per CodeYAgent run")
+            if requested_thread_id:
+                self._used_graph_thread_ids.add(requested_thread_id)
+            final = AgentLoop(self).run(user_message, thread_id=requested_thread_id or None)
+            if self.current_task_state is not None:
+                self._used_graph_thread_ids.add(self.current_task_state.graph_thread_id)
+            return final
+
+    def complete_model(self, prompt, **kwargs):
+        """Bind provider text and metadata inside one concurrency boundary."""
+
+        with self._model_client_lock:
+            return normalize_model_completion(
+                self.model_client.complete(prompt, self.max_new_tokens, **kwargs)
+            )
+
+    def complete_summary_model(self, prompt):
+        with self._summary_model_client_lock:
+            return normalize_model_completion(
+                self.summary_model_client.complete(prompt, self.summary_max_new_tokens)
+            )
+
+    def summary_model_name(self):
+        return str(
+            getattr(self.summary_model_client, "model", "")
+            or self.summary_model_client.__class__.__name__
+        )
 
     def execute_tool(self, name, args):
         result = self.tool_executor.execute(name, args)
@@ -658,7 +916,7 @@ class CodeYAgent:
     def repeated_tool_call(self, name, args):
         # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
         # 这里提前挡掉最简单的这种循环。
-        tool_events = [item for item in self.session["history"] if item["role"] == "tool"]
+        tool_events = [item for item in self.transcript_entries() if item["role"] == "tool"]
         if len(tool_events) < 2:
             return False
         recent = tool_events[-2:]
@@ -694,6 +952,8 @@ class CodeYAgent:
             "redacted_env": self.detected_secret_env_summary(),
             "skill_route": self.current_route.to_dict(),
             "session_context": dict(self.session.get("session_context", {})),
+            "conversation_summary": dict(self.conversation_summary_state()),
+            "fork_summary": dict(task_state.fork_summary),
         }
 
     def tool_example(self, name):
@@ -710,18 +970,43 @@ class CodeYAgent:
             shell_env_provider=self.shell_env,
             depth=self.depth,
             max_depth=self.max_depth,
-            spawn_delegate=self.spawn_delegate,
+            spawn_fork=self.spawn_fork,
+            max_fork_branches=self.max_fork_branches,
         )
 
-    def spawn_delegate(self, args):
-        task = str(args.get("task", "")).strip()
+    def save_fork_state(self, fork_state):
+        with self._session_lock:
+            forks = self.session["forks"]
+            forks["items"][fork_state["fork_id"]] = dict(fork_state)
+            self.save_session()
+
+    def _branch_model_client(self, spec):
+        if self.model_client_factory is None:
+            return self.model_client, self._model_client_lock
+        return self.model_client_factory(spec), None
+
+    def _create_read_only_child(
+        self,
+        task,
+        max_steps,
+        *,
+        spec=None,
+        parent_run_id="",
+        fork_id="",
+        branch_id="",
+        graph_thread_id="",
+    ):
+        model_client, model_client_lock = self._branch_model_client(spec)
         child = CodeYAgent(
-            model_client=self.model_client,
+            model_client=model_client,
+            model_client_factory=self.model_client_factory,
+            model_client_lock=model_client_lock,
+            graph_checkpointer=self.graph_checkpointer,
             workspace=self.workspace,
             session_store=self.session_store,
             run_store=self.run_store,
             approval_policy="never",
-            max_steps=int(args.get("max_steps", 3)),
+            max_steps=int(max_steps),
             max_new_tokens=self.max_new_tokens,
             depth=self.depth + 1,
             max_depth=self.max_depth,
@@ -729,13 +1014,39 @@ class CodeYAgent:
             secret_env_names=self.secret_env_names,
             shell_env_allowlist=self.shell_env_allowlist,
             feature_flags={**self.feature_flags, "self_evolution": False},
+            allowed_tools=self.allowed_tools,
             skill_mode=self.skill_mode,
+            max_fork_branches=self.max_fork_branches,
+            max_parallel_branches=self.max_parallel_branches,
+            allow_persistent_graph_checkpointer=self.allow_persistent_graph_checkpointer,
+            parent_run_id=parent_run_id,
+            fork_id=fork_id,
+            branch_id=branch_id,
+            graph_thread_id=graph_thread_id,
         )
-        # 委派的目标是“调查”，不是“放权执行”。
-        # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
-        child.session["memory"]["task"] = task
-        child.session["memory"]["notes"] = [clip(self.history_text(), 300)]
-        return "delegate_result:\n" + child.ask(task)
+        child.memory.set_task_summary(task)
+        child.memory.append_note(self.redact_artifact(clip(self.transcript_text(), 300)), source="fork-parent")
+        child.session["memory"] = child.memory.to_dict()
+        child.save_session()
+        return child
+
+    def create_fork_child(self, spec, fork_id, thread_id, max_steps):
+        parent_run_id = self.current_task_state.run_id if self.current_task_state else ""
+        return self._create_read_only_child(
+            spec.objective,
+            max_steps,
+            spec=spec,
+            parent_run_id=parent_run_id,
+            fork_id=fork_id,
+            branch_id=spec.branch_id,
+            graph_thread_id=thread_id,
+        )
+
+    def spawn_fork(self, args):
+        from .fork import ForkCoordinator
+
+        summary = ForkCoordinator(self).run(args)
+        return json.dumps(summary, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
     def tool_list_files(self, args):
         return toolkit.tool_list_files(self.tool_context(), args)
@@ -754,9 +1065,6 @@ class CodeYAgent:
 
     def tool_patch_file(self, args):
         return toolkit.tool_patch_file(self.tool_context(), args)
-
-    def tool_delegate(self, args):
-        return toolkit.tool_delegate(self.tool_context(), args)
 
     def approve(self, name, args):
         if self.read_only:
@@ -847,15 +1155,13 @@ class CodeYAgent:
 
         body = match.group("body")
         args = dict(attrs)
-        for key in ("content", "old_text", "new_text", "command", "task", "pattern", "path"):
+        for key in ("content", "old_text", "new_text", "command", "pattern", "path"):
             if f"<{key}>" in body:
                 args[key] = CodeYAgent.extract_raw(body, key)
 
         body_text = body.strip("\n")
         if name == "write_file" and "content" not in args and body_text:
             args["content"] = body_text
-        if name == "delegate" and "task" not in args and body_text:
-            args["task"] = body_text.strip()
         return {"name": name, "args": args}
 
     @staticmethod
@@ -892,9 +1198,12 @@ class CodeYAgent:
         return text[start:end]
 
     def reset(self):
-        self.session["history"] = []
-        self.session["memory"].clear()
-        self.session["memory"].update(memorylib.default_memory_state())
+        self.conversation_summarizer.invalidate()
+        with self._session_lock:
+            self.session["transcript"] = new_transcript_state()
+            self.session["conversation_summary"] = new_summary_state()
+            self.session["memory"] = memorylib.default_memory_state()
+            self._active_turn_id = ""
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
         self.current_route = RouteMatch()
         self.restore_session_context("reset")

@@ -1,4 +1,7 @@
+import hashlib
 import json
+
+import pytest
 
 from CodeY import CodeYAgent, FakeModelClient, SessionStore, WorkspaceContext
 from CodeY.core.task_state import TaskState
@@ -62,7 +65,9 @@ def test_policy_patch_requires_human_review_before_materialization(tmp_path):
     agent.ask("inspect another path")
     policy = agent.cognitive_loop.store.load_patch(policy["patch_id"])
     assert policy["status"] == "review_required"
-    assert policy["metrics"]["hit_count"] == 0
+    assert policy["metrics"]["eligible_count"] == 0
+    assert policy["metrics"]["exposed_count"] == 0
+    assert policy["metrics"]["triggered_count"] == 0
 
     approved = agent.approve_cognitive_patch(policy["patch_id"])
     policy_path = tmp_path / ".codey" / "evolution" / "behavior" / "policies.md"
@@ -134,7 +139,9 @@ def test_unrelated_success_does_not_count_as_a_patch_hit(tmp_path):
     strategy = agent.cognitive_loop.store.load_patch(strategy["patch_id"])
     assert strategy["status"] == "shadow"
     assert strategy["metrics"]["eligible_count"] == 1
-    assert strategy["metrics"]["hit_count"] == 0
+    assert strategy["metrics"]["triggered_count"] == 0
+    assert strategy["metrics"]["exposure_rate"] == 1.0
+    assert strategy["metrics"]["hit_rate"] == 0.0
 
 
 def test_verified_path_is_materialized_as_experience_after_canary(tmp_path):
@@ -313,7 +320,7 @@ def test_shadow_patch_expires_after_repeated_low_success(tmp_path):
 
     strategy = agent.cognitive_loop.store.load_patch(strategy["patch_id"])
     assert strategy["status"] == "expired"
-    assert strategy["metrics"]["hit_count"] == 2
+    assert strategy["metrics"]["triggered_count"] == 2
     assert strategy["metrics"]["success_rate"] == 0.0
     assert strategy["history"][-1]["reason"] == "success_rate_below_expiry_threshold"
 
@@ -368,18 +375,16 @@ def test_cognitive_failure_is_isolated_and_run_finished_is_terminal(tmp_path):
     assert events[-1] == "run_finished"
 
 
-def test_old_task_state_without_evolution_context_is_still_loadable():
-    state = TaskState.from_dict(
-        {
-            "run_id": "run-old",
-            "task_id": "task-old",
-            "user_request": "old task",
-            "status": "completed",
-        }
-    )
-
-    assert state.evolution_context == {}
-    assert state.to_dict()["evolution_context"] == {}
+def test_legacy_task_state_is_rejected_without_implicit_migration():
+    with pytest.raises(ValueError, match="legacy task states are not supported"):
+        TaskState.from_dict(
+            {
+                "run_id": "run-old",
+                "task_id": "task-old",
+                "user_request": "old task",
+                "status": "completed",
+            }
+        )
 
 
 def test_hybrid_advisor_disambiguates_root_cause_and_refines_patch(tmp_path):
@@ -644,3 +649,114 @@ def test_hybrid_advisor_is_not_called_when_rules_are_decisive_and_no_patch_exist
     assert agent.last_cognitive_loop["outcome"]["label"] == "correct"
     assert agent.last_cognitive_loop["decision_audit"]["diagnostic"]["status"] == "skipped_rule_decisive"
     assert agent.last_cognitive_loop["decision_audit"]["patch_generation"]["status"] == "skipped_no_candidates"
+
+
+def test_legacy_patch_schema_and_old_metric_fields_are_rejected(tmp_path):
+    agent, _ = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"read_file","args":{"start":1,"end":2}}</tool>',
+            "<final>recovered</final>",
+        ],
+    )
+    agent.ask("inspect runtime")
+    patch = patches_by_type(agent, "strategy")[0]
+    path = agent.cognitive_loop.store.patches_dir / f"{patch['patch_id']}.json"
+
+    legacy = dict(patch)
+    legacy["schema_version"] = 2
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    with pytest.raises(ValueError, match="schema_version must be 3"):
+        agent.cognitive_loop.store.load_patch(patch["patch_id"])
+
+    invalid_metrics = dict(patch)
+    invalid_metrics["metrics"] = dict(patch["metrics"])
+    invalid_metrics["metrics"]["hit_count"] = invalid_metrics["metrics"].pop("triggered_count")
+    path.write_text(json.dumps(invalid_metrics), encoding="utf-8")
+    with pytest.raises(ValueError, match="metrics schema is invalid"):
+        agent.cognitive_loop.store.load_patch(patch["patch_id"])
+
+
+def test_only_eight_eligible_patches_are_exposed_and_observed_per_run(tmp_path):
+    agent, _ = build_agent(tmp_path, [])
+    store = agent.cognitive_loop.store
+    for index in range(9):
+        fingerprint = hashlib.sha256(f"candidate-{index}".encode("utf-8")).hexdigest()
+        patch, created = store.create_candidate(
+            {
+                "type": "strategy",
+                "scope": {},
+                "correction": {
+                    "kind": "execution_guard",
+                    "action": f"Apply bounded strategy {index}.",
+                },
+                "trigger_conditions": [{"signal": "task_scope", "equals": "workspace"}],
+                "source": {
+                    "rule_candidate_fingerprint": fingerprint,
+                    "proposal_origin": "rules",
+                },
+            }
+        )
+        assert created is True
+        agent.cognitive_loop.safety_gate.initialize(patch)
+
+    state = TaskState.create("task-exposure", "exercise patch exposure", run_id="run-exposure")
+    state.finish_success("done")
+    context, guidance = agent.cognitive_loop.prepare_run(state)
+    state.evolution_context = context
+
+    assert len(context["eligible_patch_ids"]) == 9
+    assert len(context["exposed_patch_ids"]) == 8
+    assert context["exposure_scheduler"] == "least_exposed_first_v1"
+    assert guidance.count("[shadow:strategy:") == 8
+
+    agent.cognitive_loop.complete_run(state, [])
+    exposed = set(context["exposed_patch_ids"])
+    for patch_id in context["eligible_patch_ids"]:
+        metrics = store.load_patch(patch_id)["metrics"]
+        assert metrics["eligible_count"] == 1
+        if patch_id in exposed:
+            assert metrics["exposed_count"] == 1
+            assert metrics["triggered_count"] == 1
+            assert metrics["success_count"] == 1
+        else:
+            assert metrics["exposed_count"] == 0
+            assert metrics["triggered_count"] == 0
+            assert metrics["success_count"] == 0
+
+    deferred = (set(context["eligible_patch_ids"]) - exposed).pop()
+    next_state = TaskState.create(
+        "task-exposure-next",
+        "exercise patch exposure again",
+        run_id="run-exposure-next",
+    )
+    next_context, _ = agent.cognitive_loop.prepare_run(next_state)
+    assert deferred in next_context["exposed_patch_ids"]
+
+
+def test_patch_trigger_conditions_use_strict_and_semantics():
+    patch = {
+        "trigger_conditions": [
+            {"signal": "tool_name", "equals": "read_file"},
+            {"signal": "path", "equals": "README.md"},
+        ]
+    }
+    partial_trace = {
+        "tool_events": [
+            {"name": "read_file", "path": "other.txt", "affected_paths": []}
+        ]
+    }
+    complete_trace = {
+        "tool_events": [
+            {"name": "read_file", "path": "README.md", "affected_paths": []}
+        ]
+    }
+
+    assert agent_trigger_matches(patch, partial_trace) is False
+    assert agent_trigger_matches(patch, complete_trace) is True
+
+
+def agent_trigger_matches(patch, trace):
+    from CodeY.evolution.cognitive import CognitiveLoop
+
+    return CognitiveLoop._trigger_matches(patch, trace)

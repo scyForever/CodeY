@@ -1,7 +1,6 @@
 ---
 name: codey
-description: Maintain and extend the CodeY local coding-agent runtime, including prompts, tools, providers, sessions, evaluation, packaging, skills, and hooks.
-triggers: ["CodeY", "coding agent", "本地编码 Agent", "技能路由"]
+description: This skill should be used when the user's primary objective is to maintain or extend the CodeY local coding-agent runtime, and the request is best characterized as "CodeY agent runtime engineering" or "local coding assistant harness". It should not activate for generic source-code questions, unrelated agent products, or ordinary application feature work.
 ---
 
 <always-applicable>
