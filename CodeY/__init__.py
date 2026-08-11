@@ -1,5 +1,11 @@
 from .cli import build_agent, build_arg_parser, build_welcome, main
-from .providers.clients import AnthropicCompatibleModelClient, FakeModelClient, OllamaModelClient, OpenAICompatibleModelClient
+from .providers.clients import (
+    AnthropicCompatibleModelClient,
+    FakeModelClient,
+    ModelCompletion,
+    OllamaModelClient,
+    OpenAICompatibleModelClient,
+)
 from .core.runtime import CodeYAgent
 from .evolution import CognitiveLoop, EvolutionLLMConfig, EvolutionThresholds
 from .storage.session import SessionStore
@@ -10,6 +16,7 @@ from .skills.router import RouteMatch, SkillConfigurationError, SkillRouter
 __all__ = [
     "AnthropicCompatibleModelClient",
     "FakeModelClient",
+    "ModelCompletion",
     "CodeYAgent",
     "CognitiveLoop",
     "EvolutionLLMConfig",

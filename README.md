@@ -6,12 +6,13 @@ CodeY 是一个面向本地代码仓库的小型 Coding Agent Runtime。它将�
 
 ## 核心能力
 
-- **受控 Agent 循环**：模型每轮只能返回一个 `<tool>` 或 `<final>`，Runtime 负责解析、校验、执行和停止。
+- **LangGraph Agent 循环**：`Think → Reflect → Act` 通过条件边动态路由，模型每轮只能返回一个受控 `<tool>` 或 `<final>`。
+- **主 AgentLoop + 同质 Fork**：复杂任务可用 `fork_join` 并行运行多个同模板、独立 thread 的只读子 Agent，再由主 Agent 统一汇总。
 - **结构化 Skill 管理**：先进行领域 Skill 粗路由，再按 `SKILL.md` 的 Tasks 表选择任务路由。
 - **渐进式按需加载**：SessionStart 只加载 Skill 导航和 Always-read 核心约束；只有命中的任务才读取 workflow 和 route-specific 文件。
 - **XML 核心边界**：`<always-applicable>` 与 `<task-routing>` 将核心约束和路由协议分开，便于压缩后重新注入。
 - **Python Runtime Hooks**：支持 `startup`、`resume`、`reset`、`compact` 四种 SessionStart 原因。
-- **分段上下文预算**：稳定 prefix、route context、memory、相关记忆、历史和当前请求分别管理；当前请求不会被裁剪。
+- **分段上下文预算**：稳定 prefix、恢复 checkpoint、route context、memory、相关记忆、异步摘要、transcript 和当前请求分别管理；当前请求不会被裁剪。
 - **工具安全边界**：工作区路径约束、参数校验、重复调用防护、危险操作审批、只读子 Agent 和 secret redaction。
 - **可恢复与可审计**：会话、检查点、工作记忆、trace、task state 和 report 持久化到 `.codey/`。
 - **规则监督的认知闭环**：任务结束后基于结构化 trace 完成自省、结果归一化、根因归类、Patch 灰度和知识路由；可选的受限 LLM Advisor 只能消歧和精炼规则候选，不会从模型自由文本中猜测性学习。
@@ -29,13 +30,16 @@ CLI
           ▼
       CodeYAgent
        ├─ PromptPrefix（稳定规则、工具、Skill core）
-       ├─ ContextManager（route、memory、history、request）
-       ├─ AgentLoop
+       ├─ ContextManager（route、memory、summary、transcript、request）
+       ├─ LangGraph AgentLoop（Think → Reflect → Act）
        │    ├─ ModelClient
        │    ├─ ToolExecutor
+       │    ├─ ForkCoordinator ── 同质 child graphs + structured join
        │    └─ CognitiveLoop（trace、outcome、root cause、patch gate）
        └─ Session / Checkpoint / Run / Memory stores
 ```
+
+完整设计与隔离边界见 [Agent 架构设计](docs/01-Agent架构设计.md)。
 
 主要目录：
 
@@ -73,8 +77,7 @@ skills/my-skill/
 ```yaml
 ---
 name: my-skill
-description: Maintain this project's API and data pipeline.
-triggers: ["API", "data pipeline", "数据管道"]
+description: This skill should be used when the user's primary objective concerns this project's API and data pipeline, and the core intent matches "maintain service interfaces" or "operate data pipelines". It should not activate for generic coding questions, unrelated user-interface work, or routine documentation edits.
 ---
 ```
 
@@ -112,10 +115,12 @@ Always Read:
 
 ### 双层路由
 
-1. **Skill 路由**：根据每个 Skill 的 `name` 与 `triggers` 选出领域 Skill。`description` 用于导航与展示，当前不参与确定性匹配；显式 `/skill-name` 优先。
+1. **Skill 路由**：显式 `/skill-name` 优先；自动路由从 `description` 中解析两条互斥的 activation phrase 和三条 near-miss，唯一词法命中可直接选择，否则把完整候选证据交给独立 selector 模型。低置信度、near-miss 命中或非法 selector 输出都会拒绝激活或降级为空路由。
 2. **Task 路由**：只在已选 Skill 内按任务 label/trigger 匹配；无匹配时使用唯一的 `other`。
 
 一个 `ask()` 运行期间会固定路由，避免模型重试或工具循环中途切换工作流；同一 session 的下一条用户请求会重新路由。
+
+每次路由会持久化请求、全部候选证据、选择来源、执行结果和显式反馈。反馈可附带 `expected_skill_name`，从而区分正确激活、误激活与漏激活；达到样本阈值后只生成待人工审核的 Description Patch，不会直接改写线上 Skill。
 
 ### 渐进式加载
 
@@ -205,8 +210,11 @@ REPL 命令：
 - `/help`：显示帮助
 - `/memory`：显示提炼后的工作记忆
 - `/route`：显示已发现 Skill 与最近一次路由
+- `/feedback correct [expected-skill] [note]`：确认最近一次 Skill 路由
+- `/feedback incorrect <expected-skill|-> [note]`：记录误激活或漏激活
+- `/description-patch <skill-name> [min-samples]`：根据显式反馈生成待审核 Description Patch
 - `/session`：显示 session 文件路径
-- `/reset`：清空历史与工作记忆，并触发 `SessionStart(reset)`
+- `/reset`：清空 transcript、异步摘要与工作记忆，并触发 `SessionStart(reset)`
 - `/exit`：退出
 
 ### Skill 控制
@@ -249,7 +257,7 @@ codey --approval never # 拒绝危险操作
 - `run_shell`
 - `write_file`
 - `patch_file`
-- `delegate`
+- `fork_join`
 
 关键边界：
 
@@ -257,7 +265,7 @@ codey --approval never # 拒绝危险操作
 - `write_file`、`patch_file`、`run_shell` 等风险动作遵守审批策略。
 - `patch_file` 要求旧文本唯一匹配。
 - 连续重复且无进展的工具调用会被拒绝。
-- delegate 是步数受限的只读子 Agent，不能批准风险动作。
+- `fork_join` 以不同 `thread_id` 并发运行同一 StateGraph 模板；分支拥有独立 session/run，固定只读并采用 `all_settled` Join。
 - shell 只继承 allowlist 环境；trace/report 做 secret redaction。
 
 模型输出仍属于不可信输入。若把 CodeY 用于不可信仓库或高风险执行环境，应额外使用容器、受限系统用户和网络隔离。
@@ -267,13 +275,15 @@ codey --approval never # 拒绝危险操作
 最终 prompt 的顺序是：
 
 1. 稳定 prefix：Runtime 规则、工具协议、Skill core、workspace 基线
-2. route context：当前任务 workflow 与按需读取文件
-3. working memory
-4. relevant memory
-5. 压缩后的 transcript
-6. 当前用户请求
+2. recovery checkpoint：恢复状态、当前目标、阻塞点、下一步与关键文件
+3. route context：当前任务 workflow 与按需读取文件
+4. working memory
+5. relevant memory
+6. 已提交的异步会话摘要
+7. 摘要尚未覆盖的旧 transcript、最近 N 个完整 turn 与未完成 turn 原文
+8. 当前用户请求
 
-超预算时优先压缩相关记忆和旧历史，再压缩 working memory、route context 与 prefix。当前请求永不裁剪。每轮 metadata 记录 section 大小、压缩步骤、prefix/workspace/tool/skill fingerprint 和路由加载证据。
+每个完整 turn 结束后，可独立配置的 summary client 异步刷新结构化摘要；提交时校验 coverage、source hash 和 generation，再通过 session revision CAS 持久化，失败时回滚当前进程内存状态。摘要失败、仍在运行或因进程重启中断时，未覆盖 transcript 继续以 fallback 原文进入上下文；CLI 退出会在有界超时内等待摘要落盘。超预算时按完整 turn 分组裁剪旧 transcript，再压缩相关记忆、working memory、route context 与 prefix；当前请求永不裁剪。每轮 metadata 记录 section 大小、压缩步骤、摘要覆盖状态、prefix/workspace/tool/skill fingerprint 和路由加载证据。
 
 `prompt_cache_key` 是 CodeY 的稳定 prefix 身份。只有 provider adapter 明确声明支持时才会下发；当前 Anthropic-compatible 适配器并不等于官方 Anthropic SDK，也不会因此自动获得所有原生 prompt caching 能力。
 
@@ -287,7 +297,8 @@ codey --approval never # 拒绝危险操作
 ├─ runs/<run-id>/
 │  ├─ task_state.json
 │  ├─ trace.jsonl
-│  └─ report.json
+│  ├─ report.json
+│  └─ branches/<fork-id>/<branch-id>.json
 ├─ memory/
    ├─ MEMORY.md
    └─ topics/*.md
@@ -300,7 +311,7 @@ codey --approval never # 拒绝危险操作
       └─ experience/*.md
 ```
 
-- **session**：可恢复的历史、memory、checkpoint 和 session context。
+- **session**：可恢复的 transcript、异步摘要状态、memory、checkpoint 和 session context。当前 schema 严格校验，旧 schema 不会隐式兼容或修复。
 - **task_state**：一次 ask 的状态、route、工具步数和停止原因。
 - **trace**：逐事件时间线。
 - **report**：一次运行的结果与关键 metadata。
@@ -359,7 +370,7 @@ Patch 是 JSON 对象，至少包含 `type`、`scope`、`correction`、`trigger_
 - `policy`：`draft -> review_required -> active -> expired`，绝不自动升级；只能调用 `agent.approve_cognitive_patch(patch_id)` 完成人工批准。
 - `knowledge_definition`：CodeY 采用更保守的仓库级取舍，也进入 `review_required`，避免仅凭文件名自动改写架构边界。
 
-`shadow` 不是被动计数：同 scope 的候选按稳定哈希进入少量任务 prompt，并标记为 shadow guidance；只有本次 trace 实际触发 Patch 声明的目标工具或路径才计为 hit，无关任务的成功不会抬高成功率。默认参数为 20% 灰度流量、至少 3 次命中、命中率不低于 10%、成功率不低于 80% 才激活；累计 100 次命中后成功率低于 40% 会过期，任何 `harmful` 灰度结果会立即过期。激活后仍持续统计，后续退化也会触发过期；过期 Patch 保留 JSON 审计记录，但会从 active 知识视图移除。
+`shadow` 不是被动计数：同 scope 的候选按稳定哈希进入少量任务 prompt，并标记为 shadow guidance；每轮最多暴露 8 条，并用 `least_exposed_first_v1` 优先调度累计暴露更少的 Patch，避免固定排序饥饿。只有实际渲染到 prompt 的 Patch 才进入 exposed 集合，且只有本次 trace 满足其全部 trigger condition 才计为 triggered。指标分母固定为 `exposure_rate = exposed / eligible`、`hit_rate = triggered / exposed`、`success_rate = success / triggered`，无关任务的成功不会抬高成功率。默认参数为 20% 灰度流量、至少 3 次命中、命中率不低于 10%、成功率不低于 80% 才激活；累计 100 次命中后成功率低于 40% 会过期，任何 `harmful` 灰度结果会立即过期。激活后仍持续统计，后续退化也会触发过期；过期 Patch 保留 JSON 审计记录，但会从 active 知识视图移除。
 
 激活 Patch 的知识视图按类型路由：Policy 写入 `behavior/policies.md`，Strategy/Action Chain 写入 `decisions.md`，定义与经验分别写入 `knowledge/definition/` 和 `knowledge/experience/`。这些路径都位于 workspace 的 `.codey/evolution/` 下，Patch JSON 是审计事实源。Python API 可通过 `evolution_thresholds={...}` 覆盖阈值，或用 `feature_flags={"self_evolution": False}` 关闭闭环。
 

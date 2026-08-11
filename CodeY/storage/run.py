@@ -32,6 +32,9 @@ class RunStore:
     def report_path(self, run_id):
         return self.run_dir(run_id) / "report.json"
 
+    def branch_result_path(self, run_id, fork_id, branch_id):
+        return self.run_dir(run_id) / "branches" / str(fork_id) / f"{branch_id}.json"
+
     def start_run(self, task_state):
         # 每次 ask() 都会生成一个 run 目录。
         # 这样一次用户请求对应一组独立工件，后续排查更容易。
@@ -67,6 +70,16 @@ class RunStore:
 
     def load_report(self, task_id):
         return json.loads(self.report_path(task_id).read_text(encoding="utf-8"))
+
+    def write_branch_result(self, run_id, fork_id, branch_id, result):
+        path = self.branch_result_path(run_id, fork_id, branch_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_json_atomic(path, result)
+        return path
+
+    def load_branch_result(self, run_id, fork_id, branch_id):
+        path = self.branch_result_path(run_id, fork_id, branch_id)
+        return json.loads(path.read_text(encoding="utf-8"))
 
     def _write_json_atomic(self, path, payload):
         # 原子写：先写临时文件，再 replace。

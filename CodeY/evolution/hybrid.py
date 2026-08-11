@@ -16,6 +16,8 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Mapping
 
+from ..providers.clients import ModelCompletion
+
 
 OUTCOME_LABELS = {"correct", "incorrect", "partial", "harmful"}
 ROOT_CAUSE_LEVELS = {"policy", "strategy", "chain", "execution"}
@@ -287,11 +289,13 @@ class HybridEvolutionAdvisor:
         for attempt in range(int(self.config.max_attempts)):
             audit["attempts"] = attempt + 1
             try:
-                raw = self.client.complete(prompt, int(self.config.max_new_tokens))
+                completion = self.client.complete(prompt, int(self.config.max_new_tokens))
+                if not isinstance(completion, ModelCompletion):
+                    raise TypeError("evolution advisor client must return ModelCompletion")
             except Exception as exc:  # The primary task must survive advisor/provider failures.
                 last_error = f"model_error_{type(exc).__name__}"
                 continue
-            payload = self._strict_json(raw)
+            payload = self._strict_json(completion.text)
             if payload is not None:
                 return payload, audit
             last_error = "invalid_json"

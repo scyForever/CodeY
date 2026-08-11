@@ -1,33 +1,55 @@
 """Prompt 组装与上下文预算控制。
 
-这个模块负责决定：每一轮到底把多少 prefix、memory、相关笔记、历史
+这个模块负责决定：每一轮到底把多少 prefix、checkpoint、memory、相关笔记、摘要、transcript
 以及当前用户请求送进模型。
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
+
+from .transcript import DEFAULT_RECENT_TURNS, render_transcript_entries, split_for_context
 
 
 DEFAULT_TOTAL_BUDGET = 12000
 DEFAULT_SECTION_BUDGETS = {
-    "prefix": 3600,
-    "route_context": 2200,
-    "memory": 1600,
-    "relevant_memory": 1200,
-    "history": 5200,
+    "prefix": 3200,
+    "checkpoint": 1200,
+    "route_context": 1800,
+    "memory": 1300,
+    "relevant_memory": 900,
+    "conversation_summary": 1800,
+    "transcript": 3600,
 }
 DEFAULT_SECTION_FLOORS = {
     "prefix": 1200,
+    "checkpoint": 500,
     "route_context": 500,
     "memory": 400,
     "relevant_memory": 300,
-    "history": 1500,
+    "conversation_summary": 500,
+    "transcript": 1500,
 }
-# 当 prompt 超预算时，会优先压缩旧记忆和历史，最后才动当前任务路由与稳定前缀。
-DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "memory", "route_context", "prefix")
-SECTION_ORDER = ("prefix", "route_context", "memory", "relevant_memory", "history", "current_request")
+# 当前请求永不裁剪；稳定约束和最近对话晚于可重建的记忆与摘要被压缩。
+DEFAULT_REDUCTION_ORDER = (
+    "relevant_memory",
+    "memory",
+    "conversation_summary",
+    "transcript",
+    "checkpoint",
+    "route_context",
+    "prefix",
+)
+SECTION_ORDER = (
+    "prefix",
+    "checkpoint",
+    "route_context",
+    "memory",
+    "relevant_memory",
+    "conversation_summary",
+    "transcript",
+    "current_request",
+)
 CURRENT_REQUEST_SECTION = "current_request"
 RELEVANT_MEMORY_LIMIT = 3
 
@@ -83,7 +105,7 @@ class ContextManager:
         为什么存在：
         仅靠用户这一轮输入，模型并不知道当前仓库状态、会话里已经读过什么、
         哪些旧信息还值得继续参考。这个函数负责把“稳定基线 + 工作记忆 +
-        相关笔记 + 历史 + 当前请求”拼成真正发给模型的 prompt。
+        相关笔记 + 摘要 + transcript + 当前请求”拼成真正发给模型的 prompt。
 
         输入 / 输出：
         - 输入：`user_message`，也就是用户当前这一轮的新请求。
@@ -102,40 +124,26 @@ class ContextManager:
         self.section_floors = self._compute_section_floors()
         memory_enabled = True
         relevant_memory_enabled = True
-        context_reduction_enabled = True
         if hasattr(self.agent, "feature_enabled"):
             memory_enabled = self.agent.feature_enabled("memory")
             relevant_memory_enabled = self.agent.feature_enabled("relevant_memory")
-            context_reduction_enabled = self.agent.feature_enabled("context_reduction")
         section_texts = {
             "prefix": str(getattr(self.agent, "prefix", "")),
+            "checkpoint": "",
             "route_context": str(getattr(getattr(self.agent, "current_route", None), "route_context", "")) or "Selected task route:\n- none",
             "memory": "Memory:\n- disabled" if not memory_enabled else str(self.agent.memory_text()),
-            "history": "",
+            "conversation_summary": self._conversation_summary_raw(),
+            "transcript": "",
             CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}",
         }
         checkpoint_text = ""
         if hasattr(self.agent, "render_checkpoint_text"):
             checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
         if checkpoint_text:
-            section_texts["prefix"] = section_texts["prefix"] + "\n\n" + checkpoint_text
+            section_texts["checkpoint"] = checkpoint_text
         selected_notes = []
         if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
             selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
-
-        if not context_reduction_enabled:
-            rendered = self._render_sections_without_reduction(section_texts, selected_notes=selected_notes)
-            prompt = self._assemble_prompt(rendered)
-            metadata = self._metadata(
-                prompt=prompt,
-                rendered=rendered,
-                budgets={section: render.budget for section, render in rendered.items() if section != CURRENT_REQUEST_SECTION},
-                reduction_log=[],
-                selected_notes=selected_notes,
-                user_message=user_message,
-                section_texts=section_texts,
-            )
-            return prompt, metadata
 
         budgets = dict(self.section_budgets)
         rendered = self._render_sections(section_texts, budgets, selected_notes=selected_notes)
@@ -143,8 +151,7 @@ class ContextManager:
         reduction_log = []
 
         # 如果 prompt 超预算，就按固定顺序不断压缩。
-        # 这里的顺序体现了平台偏好：
-        # 先牺牲 relevant_memory，再牺牲 history，然后才动 memory 和 prefix。
+        # 这里的顺序体现了平台偏好：先牺牲可重建记忆，再压缩摘要和 transcript。
         # 最新用户请求永远不裁剪，因为那是本轮最重要的输入。
         while len(prompt) > self.total_budget:
             overflow = len(prompt) - self.total_budget
@@ -184,41 +191,6 @@ class ContextManager:
         )
         return prompt, metadata
 
-    def _render_sections_without_reduction(self, section_texts, selected_notes=None):
-        selected_notes = selected_notes or []
-        relevant_lines = ["Relevant memory:"]
-        if selected_notes:
-            relevant_lines.extend(f"- {note['text']}" for note in selected_notes)
-        else:
-            relevant_lines.append("- none")
-        relevant_raw = "\n".join(relevant_lines)
-        history = list(getattr(self.agent, "session", {}).get("history", []))
-        history_raw = self._raw_history_text(history)
-        return {
-            "prefix": SectionRender(raw=section_texts["prefix"], budget=len(section_texts["prefix"]), rendered=section_texts["prefix"], details={}),
-            "route_context": SectionRender(raw=section_texts["route_context"], budget=len(section_texts["route_context"]), rendered=section_texts["route_context"], details={}),
-            "memory": SectionRender(raw=section_texts["memory"], budget=len(section_texts["memory"]), rendered=section_texts["memory"], details={}),
-            "relevant_memory": SectionRender(
-                raw=relevant_raw,
-                budget=len(relevant_raw),
-                rendered=relevant_raw,
-                details={
-                    "selected_notes": [note["text"] for note in selected_notes],
-                    "rendered_notes": [note["text"] for note in selected_notes],
-                    "selected_count": len(selected_notes),
-                    "rendered_count": len(selected_notes),
-                    "note_budget": 0,
-                },
-            ),
-            "history": SectionRender(raw=history_raw, budget=len(history_raw), rendered=history_raw, details={"rendered_entries": []}),
-            CURRENT_REQUEST_SECTION: SectionRender(
-                raw=section_texts[CURRENT_REQUEST_SECTION],
-                budget=0,
-                rendered=section_texts[CURRENT_REQUEST_SECTION],
-                details={},
-            ),
-        }
-
     def _compute_section_floors(self):
         floors = {
             section: max(20, int(budget) // 4)
@@ -236,8 +208,16 @@ class ContextManager:
                 rendered[section] = SectionRender(raw=raw, budget=0, rendered=raw, details={})
             elif section == "relevant_memory":
                 rendered[section] = self._render_relevant_memory(selected_notes or [], int(budget or 0))
-            elif section == "history":
-                rendered[section] = self._render_history_section(int(budget or 0))
+            elif section == "conversation_summary":
+                raw = section_texts[section]
+                rendered[section] = SectionRender(
+                    raw=raw,
+                    budget=int(budget or 0),
+                    rendered=_tail_clip(raw, int(budget or 0)),
+                    details=self._conversation_summary_details(),
+                )
+            elif section == "transcript":
+                rendered[section] = self._render_transcript_section(int(budget or 0))
             else:
                 raw = section_texts[section]
                 rendered_text = _tail_clip(raw, int(budget)) if budget is not None else raw
@@ -298,164 +278,128 @@ class ContextManager:
         usable = max(0, budget - overhead)
         return max(1, usable // note_count)
 
-    def _render_history_section(self, budget):
-        history = list(getattr(self.agent, "session", {}).get("history", []))
-        raw = self._raw_history_text(history)
-        if not history:
-            rendered = "Transcript:\n- empty"
-            return SectionRender(
-                raw=raw,
-                budget=budget,
-                rendered=rendered,
-                details={
-                    "rendered_entries": [],
-                    "older_entries_count": 0,
-                    "collapsed_duplicate_reads": 0,
-                    "reused_file_summary_count": 0,
-                    "summarized_tool_count": 0,
-                },
-            )
+    def _conversation_summary_raw(self):
+        committed = self.agent.conversation_summary_state()["committed"]
+        text = committed["text"] or "- none"
+        return (
+            "Conversation summary "
+            f"(generation={committed['generation']}, covered_through={committed['covered_through_sequence']}):\n"
+            f"{text}"
+        )
 
-        # 优先保留最近的历史，因为下一步决策通常最依赖刚刚发生的工具结果。
-        recent_window = 6
-        recent_start = max(0, len(history) - recent_window)
-        history_entries, history_details = self._compressed_history_entries(history, recent_start)
-        rendered_entries = []
-        for entry in reversed(history_entries):
-            recent = bool(entry.get("recent", False))
-            candidate_lines = list(entry.get("lines", []))
-            candidate_entries = candidate_lines + rendered_entries
-            candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
-            if len(candidate_rendered) <= budget:
-                rendered_entries = candidate_entries
-                continue
-            if recent:
-                available = budget - len("Transcript:")
-                if rendered_entries:
-                    available -= sum(len(line) + 1 for line in rendered_entries)
-                available = max(20, available - 1)
-                candidate_lines = [_tail_clip(line, available) for line in candidate_lines]
-                candidate_entries = candidate_lines + rendered_entries
-                candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
-                if len(candidate_rendered) <= budget:
-                    rendered_entries = candidate_entries
-            else:
-                smaller_lines = [_tail_clip(line, 20) for line in candidate_lines]
-                smaller_entries = smaller_lines + rendered_entries
-                smaller_rendered = "\n".join(["Transcript:", *smaller_entries])
-                if len(smaller_rendered) <= budget:
-                    rendered_entries = smaller_entries
-        rendered = "\n".join(["Transcript:", *rendered_entries])
+    def _conversation_summary_details(self):
+        state = self.agent.conversation_summary_state()
+        committed = state["committed"]
+        pending = state.get("pending") or {}
+        return {
+            "generation": committed["generation"],
+            "covered_through_sequence": committed["covered_through_sequence"],
+            "source_hash": committed["source_hash"],
+            "pending_generation": int(pending.get("generation", 0)),
+            "pending_covered_through_sequence": int(pending.get("covered_through_sequence", 0)),
+            "last_error": dict(state.get("last_error") or {}),
+        }
 
-        if len(rendered) > budget and budget > 0:
-            rendered = _tail_clip(raw, budget)
-
+    def _render_transcript_section(self, budget, enforce_budget=True):
+        entries = self.agent.transcript_entries()
+        active_turn_id = str(getattr(self.agent, "_active_turn_id", ""))
+        older, recent, current = split_for_context(
+            entries,
+            recent_turns=getattr(self.agent.conversation_summarizer, "recent_turns", DEFAULT_RECENT_TURNS)
+            if hasattr(self.agent, "conversation_summarizer")
+            else DEFAULT_RECENT_TURNS,
+            current_turn_id=active_turn_id,
+        )
+        covered = self.agent.conversation_summary_state()["committed"]["covered_through_sequence"]
+        pending_fallback = [entry for entry in older if entry["sequence"] > covered]
+        current_visible = [entry for entry in current if entry["role"] != "user"]
+        groups = self._transcript_groups(pending_fallback, recent, current_visible)
+        raw = self._render_transcript_groups(groups)
+        rendered_groups = list(groups)
+        rendered = raw
+        truncated = False
+        if enforce_budget and budget > 0 and len(rendered) > budget:
+            truncated = True
+            selected = []
+            for group in reversed(groups):
+                candidate = [group, *selected]
+                candidate_text = self._render_transcript_groups(candidate)
+                if len(candidate_text) <= budget:
+                    selected = candidate
+                    continue
+                if not selected:
+                    available = max(20, budget - len("Transcript:\n"))
+                    selected = [{**group, "text": _tail_clip(group["text"], available)}]
+                break
+            rendered_groups = selected
+            rendered = self._render_transcript_groups(rendered_groups)
+            if len(rendered) > budget:
+                rendered = _tail_clip(rendered, budget)
+        rendered_turn_ids = [group["turn_id"] for group in rendered_groups]
         return SectionRender(
             raw=raw,
             budget=budget,
             rendered=rendered,
             details={
-                "recent_window": recent_window,
-                "recent_start": recent_start,
-                "rendered_entries": rendered_entries,
-                **history_details,
+                "recent_turn_limit": getattr(
+                    getattr(self.agent, "conversation_summarizer", None),
+                    "recent_turns",
+                    DEFAULT_RECENT_TURNS,
+                ),
+                "pending_fallback_entries": len(pending_fallback),
+                "recent_turn_count": len({entry["turn_id"] for entry in recent}),
+                "current_turn_entries": len(current_visible),
+                "rendered_turn_ids": rendered_turn_ids,
+                "rendered_turn_count": len(rendered_turn_ids),
+                "truncated": truncated,
             },
         )
 
-    def _compressed_history_entries(self, history, recent_start):
-        entries = []
-        seen_older_reads = set()
-        details = {
-            "older_entries_count": 0,
-            "collapsed_duplicate_reads": 0,
-            "reused_file_summary_count": 0,
-            "summarized_tool_count": 0,
-        }
-
-        for index, item in enumerate(history):
-            recent = index >= recent_start
-            if recent:
-                line_limit = 900
-                entries.append(
+    @staticmethod
+    def _transcript_groups(pending_fallback, recent, current):
+        groups = []
+        for scope, entries in (
+            ("summary-pending-fallback", pending_fallback),
+            ("recent-original", recent),
+            ("current-turn", current),
+        ):
+            by_turn = []
+            current_id = None
+            bucket = []
+            for entry in entries:
+                if entry["turn_id"] != current_id:
+                    if bucket:
+                        by_turn.append((current_id, bucket))
+                    current_id = entry["turn_id"]
+                    bucket = []
+                bucket.append(entry)
+            if bucket:
+                by_turn.append((current_id, bucket))
+            for turn_id, turn_entries in by_turn:
+                groups.append(
                     {
-                        "recent": True,
-                        "lines": self._render_history_item(item, line_limit),
+                        "scope": scope,
+                        "turn_id": turn_id,
+                        "text": render_transcript_entries(turn_entries),
                     }
                 )
-                continue
+        return groups
 
-            if item["role"] == "tool" and item["name"] == "read_file":
-                path = str(item["args"].get("path", "")).strip()
-                if path in seen_older_reads:
-                    details["collapsed_duplicate_reads"] += 1
-                    continue
-                seen_older_reads.add(path)
-                summary = self._reusable_file_summary(path)
-                if summary:
-                    entries.append({"recent": False, "lines": [f"{path} -> {summary}"]})
-                    details["older_entries_count"] += 1
-                    details["reused_file_summary_count"] += 1
-                    continue
-
-            if item["role"] == "tool":
-                summary_line = self._summarize_old_tool_item(item)
-                entries.append({"recent": False, "lines": [summary_line]})
-                details["older_entries_count"] += 1
-                details["summarized_tool_count"] += 1
-                continue
-
-            entries.append({"recent": False, "lines": self._render_history_item(item, 60)})
-
-        return entries, details
-
-    def _reusable_file_summary(self, path):
-        memory = getattr(self.agent, "memory", None)
-        if memory is None or not hasattr(memory, "to_dict"):
-            return ""
-        snapshot = memory.to_dict()
-        summary = snapshot.get("file_summaries", {}).get(str(path), {})
-        if not summary:
-            return ""
-        return str(summary.get("summary", "")).strip()
-
-    def _summarize_old_tool_item(self, item):
-        if item["name"] == "run_shell":
-            command = str(item["args"].get("command", "")).strip() or "shell"
-            lines = [line.strip() for line in str(item.get("content", "")).splitlines() if line.strip()]
-            summary = " | ".join(lines[:3]) if lines else "(empty)"
-            return f"{command} -> {summary}"
-        return self._render_history_item(item, 60)[0]
-
-    def _raw_history_text(self, history):
-        if not history:
+    @staticmethod
+    def _render_transcript_groups(groups):
+        if not groups:
             return "Transcript:\n- empty"
-        lines = []
-        for item in history:
-            if item["role"] == "tool":
-                lines.append(f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}")
-                lines.append(str(item["content"]))
-            else:
-                lines.append(f"[{item['role']}] {item['content']}")
-        return "\n".join(["Transcript:", *lines])
-
-    def _render_history_item(self, item, line_limit):
-        if item["role"] == "tool":
-            prefix = f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}"
-            content = _tail_clip(item["content"], max(20, line_limit))
-            return [prefix, content]
-        return [f"[{item['role']}] {_tail_clip(item['content'], line_limit)}"]
+        parts = ["Transcript:"]
+        for group in groups:
+            parts.append(f"[turn:{group['turn_id']} scope:{group['scope']}]\n{group['text']}")
+        return "\n".join(parts)
 
     def _assemble_prompt(self, rendered):
         # 顺序是刻意设计的：稳定规则放前面，最新请求放最后。
         return "\n\n".join(
-            [
-                rendered["prefix"].rendered,
-                rendered["route_context"].rendered,
-                rendered["memory"].rendered,
-                rendered["relevant_memory"].rendered,
-                rendered["history"].rendered,
-                rendered[CURRENT_REQUEST_SECTION].rendered,
-            ]
+            rendered[section].rendered
+            for section in SECTION_ORDER
+            if rendered[section].rendered
         ).strip()
 
     def _metadata(self, prompt, rendered, budgets, reduction_log, selected_notes, user_message, section_texts):
@@ -502,13 +446,15 @@ class ContextManager:
                 "raw_chars": rendered["route_context"].raw_chars,
                 "rendered_chars": rendered["route_context"].rendered_chars,
             },
-            "history": {
-                "raw_chars": rendered["history"].raw_chars,
-                "rendered_chars": rendered["history"].rendered_chars,
-                "older_entries_count": int(rendered["history"].details.get("older_entries_count", 0)),
-                "collapsed_duplicate_reads": int(rendered["history"].details.get("collapsed_duplicate_reads", 0)),
-                "reused_file_summary_count": int(rendered["history"].details.get("reused_file_summary_count", 0)),
-                "summarized_tool_count": int(rendered["history"].details.get("summarized_tool_count", 0)),
+            "conversation_summary": {
+                "raw_chars": rendered["conversation_summary"].raw_chars,
+                "rendered_chars": rendered["conversation_summary"].rendered_chars,
+                **dict(rendered["conversation_summary"].details or {}),
+            },
+            "transcript": {
+                "raw_chars": rendered["transcript"].raw_chars,
+                "rendered_chars": rendered["transcript"].rendered_chars,
+                **dict(rendered["transcript"].details or {}),
             },
             "current_request": {
                 "text": user_message,

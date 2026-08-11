@@ -44,15 +44,19 @@ BASE_TOOL_SPECS = {
     },
 }
 
-DELEGATE_TOOL_SPEC = {
-    "schema": {"task": "str", "max_steps": "int=3"},
+FORK_JOIN_TOOL_SPEC = {
+    "schema": {
+        "tasks": "list[{id:str,objective:str}]",
+        "max_steps": "int=3",
+        "join_policy": "str='all_settled'",
+    },
     "risky": False,
-    "description": "Ask a bounded read-only child agent to investigate.",
+    "description": "Run bounded read-only objectives in parallel with homogeneous child agents and return structured results.",
 }
 
 
 def legal_tool_names():
-    return set(BASE_TOOL_SPECS) | {"delegate"}
+    return set(BASE_TOOL_SPECS) | {"fork_join"}
 
 TOOL_EXAMPLES = {
     "list_files": '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
@@ -61,7 +65,7 @@ TOOL_EXAMPLES = {
     "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
     "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-    "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3}}</tool>',
+    "fork_join": '<tool>{"name":"fork_join","args":{"tasks":[{"id":"api","objective":"inspect the API"},{"id":"tests","objective":"inspect tests"}],"max_steps":3}}</tool>',
 }
 
 
@@ -73,9 +77,9 @@ def build_tool_registry(context):
         for name, spec in BASE_TOOL_SPECS.items()
     }
     # 子 agent 是刻意做成受限能力的：一旦深度耗尽，
-    # 就连 delegate 这个工具都不再暴露给模型。
+    # fork_join 不再暴露给模型，避免无界递归。
     if context.depth < context.max_depth:
-        tools["delegate"] = {**DELEGATE_TOOL_SPEC, "run": partial(tool_delegate, context)}
+        tools["fork_join"] = {**FORK_JOIN_TOOL_SPEC, "run": partial(tool_fork_join, context)}
     return tools
 
 
@@ -143,12 +147,34 @@ def validate_tool(context, name, args):
             raise ValueError(f"old_text must occur exactly once, found {count}")
         return
 
-    if name == "delegate":
-        task = str(args.get("task", "")).strip()
-        if not task:
-            raise ValueError("task must not be empty")
+    if name == "fork_join":
         if context.depth >= context.max_depth:
-            raise ValueError("delegate depth exceeded")
+            raise ValueError("fork depth exceeded")
+        tasks = args.get("tasks")
+        if not isinstance(tasks, list):
+            raise ValueError("tasks must be a list")
+        if len(tasks) < 2:
+            raise ValueError("fork_join requires at least two tasks")
+        if len(tasks) > context.max_fork_branches:
+            raise ValueError(f"fork_join accepts at most {context.max_fork_branches} tasks")
+        seen = set()
+        for index, item in enumerate(tasks):
+            if not isinstance(item, dict):
+                raise ValueError(f"tasks[{index}] must be an object")
+            objective = str(item.get("objective", "")).strip()
+            if not objective:
+                raise ValueError(f"tasks[{index}].objective must not be empty")
+            branch_id = str(item.get("id", f"branch-{index + 1}")).strip()
+            if not branch_id:
+                raise ValueError(f"tasks[{index}].id must not be empty")
+            if branch_id in seen:
+                raise ValueError(f"duplicate branch id: {branch_id}")
+            seen.add(branch_id)
+        max_steps = int(args.get("max_steps", 3))
+        if max_steps < 1 or max_steps > 12:
+            raise ValueError("max_steps must be in [1, 12]")
+        if str(args.get("join_policy", "all_settled")) != "all_settled":
+            raise ValueError("join_policy must be 'all_settled'")
         return
 
 
@@ -264,13 +290,10 @@ def tool_patch_file(context, args):
     return f"patched {path.relative_to(context.root)}"
 
 
-def tool_delegate(context, args):
+def tool_fork_join(context, args):
     if context.depth >= context.max_depth:
-        raise ValueError("delegate depth exceeded")
-    task = str(args.get("task", "")).strip()
-    if not task:
-        raise ValueError("task must not be empty")
-    return context.spawn_delegate(args)
+        raise ValueError("fork depth exceeded")
+    return context.spawn_fork(args)
 
 
 _TOOL_RUNNERS = {

@@ -99,6 +99,7 @@ def build_arg_parser():
         help="Optional comma-separated case IDs. Empty means every selected case.",
     )
     parser.add_argument("--provider", choices=("openai", "anthropic", "deepseek"))
+    parser.add_argument("--model", default=None, help="Explicit model override for the selected provider.")
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--transport-attempts", type=int, default=3)
     parser.add_argument(
@@ -318,6 +319,7 @@ def main(argv=None):
         client, private_provider = build_external_model_client(
             ROOT,
             provider=args.provider,
+            model_override=args.model,
             timeout=args.timeout,
             transport_attempts=args.transport_attempts,
         )

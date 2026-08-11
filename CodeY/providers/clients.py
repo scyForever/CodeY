@@ -7,16 +7,36 @@ runtime 只关心一件事：给我一个 prompt，我拿回一段文本。
 
 import json
 import time
+from dataclasses import dataclass
 from http.client import RemoteDisconnected
 import urllib.error
 import urllib.request
 
-OPENAI_COMPATIBLE_USER_AGENT = "codey/0.1"
+OPENAI_COMPATIBLE_USER_AGENT = "claude-cli/2.1.218 (external, cli)"
 RETRYABLE_HTTP_CODES = {408, 409, 425, 429, 500, 502, 503, 504, 524}
 
 
-def _http_retry_delay(exc, attempt):
+@dataclass(frozen=True)
+class ModelCompletion:
+    """A model response with request-scoped metadata bound to its text."""
+
+    text: str
+    metadata: dict
+
+
+def normalize_model_completion(value):
+    if not isinstance(value, ModelCompletion):
+        raise TypeError("model clients must return ModelCompletion")
+    return value
+
+
+def _http_retry_delay(exc, attempt, body=None):
     retry_after = (getattr(exc, "headers", None) or {}).get("Retry-After")
+    if not retry_after and body:
+        try:
+            retry_after = json.loads(body).get("retry_after")
+        except (AttributeError, json.JSONDecodeError, TypeError):
+            retry_after = None
     if retry_after:
         try:
             return min(120.0, max(1.0, float(retry_after)))
@@ -26,7 +46,15 @@ def _http_retry_delay(exc, attempt):
         return min(60.0, 10.0 * (2**attempt))
     if exc.code == 524:
         return 120.0
+    if exc.code == 404:
+        return 180.0
     return 0.5 * (attempt + 1)
+
+
+def _is_retryable_http_error(exc, body):
+    if exc.code in RETRYABLE_HTTP_CODES:
+        return True
+    return exc.code == 404 and body.strip().lower() == "404 page not found"
 
 
 class FakeModelClient:
@@ -34,15 +62,15 @@ class FakeModelClient:
         self.outputs = list(outputs)
         self.prompts = []
         self.supports_prompt_cache = False
-        self.last_completion_metadata = {}
 
     def complete(self, prompt, max_new_tokens, **kwargs):
         self.prompts.append(prompt)
-        if not getattr(self, "last_completion_metadata", None):
-            self.last_completion_metadata = {}
         if not self.outputs:
             raise RuntimeError("fake model ran out of outputs")
-        return self.outputs.pop(0)
+        value = self.outputs.pop(0)
+        if isinstance(value, ModelCompletion):
+            return value
+        return ModelCompletion(text=str(value), metadata={})
 
 
 class OllamaModelClient:
@@ -53,12 +81,10 @@ class OllamaModelClient:
         self.top_p = top_p
         self.timeout = timeout
         self.supports_prompt_cache = False
-        self.last_completion_metadata = {}
 
     def complete(self, prompt, max_new_tokens, **kwargs):
         # Ollama 当前不支持我们这里接入的 prompt cache 语义，
         # 所以 runtime 传下来的缓存参数会被忽略。
-        self.last_completion_metadata = {}
         payload = {
             "model": self.model,
             "prompt": prompt,
@@ -93,7 +119,16 @@ class OllamaModelClient:
 
         if data.get("error"):
             raise RuntimeError(f"Ollama error: {data['error']}")
-        return data.get("response", "")
+        return ModelCompletion(
+            text=str(data.get("response", "")),
+            metadata={
+                "input_tokens": data.get("prompt_eval_count"),
+                "output_tokens": data.get("eval_count"),
+                "total_tokens": (
+                    int(data.get("prompt_eval_count") or 0) + int(data.get("eval_count") or 0)
+                ),
+            },
+        )
 
 
 def _normalize_versioned_base_url(base_url):
@@ -249,7 +284,6 @@ class OpenAICompatibleModelClient:
         # 当前只在明确支持 prompt cache 语义的后端上启用这条链路，
         # 避免对不支持的后端传一个“看起来统一、其实没意义”的伪参数。
         self.supports_prompt_cache = any(host in self.base_url for host in ("openai.com", "right.codes"))
-        self.last_completion_metadata = {}
 
     def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
         """向 OpenAI-compatible `/responses` 接口发起一次模型调用。
@@ -261,14 +295,12 @@ class OpenAICompatibleModelClient:
 
         输入 / 输出：
         - 输入：完整 prompt、最大输出 token，以及可选的 prompt cache 参数
-        - 输出：模型最终文本；同时把 usage / cached_tokens 等元数据写进
-          `self.last_completion_metadata`
+        - 输出：绑定文本与 usage/cache 元数据的 `ModelCompletion`
 
         在 agent 链路里的位置：
         它位于 `CodeYAgent.ask()` 的模型调用阶段，是稳定前缀缓存复用链路真正
         落到 provider API 的地方。
         """
-        self.last_completion_metadata = {}
         payload = {
             "model": self.model,
             "input": [
@@ -288,7 +320,7 @@ class OpenAICompatibleModelClient:
         if self.temperature is not None:
             payload["temperature"] = self.temperature
         # runtime 传入的是“稳定前缀”的签名，而不是整段 prompt 的签名。
-        # 这样缓存复用针对的是稳定段，不会因为动态 history 每轮变化而失效。
+        # 这样缓存复用针对的是稳定段，不会因为动态 transcript 每轮变化而失效。
         if self.supports_prompt_cache and prompt_cache_key:
             payload["prompt_cache_key"] = prompt_cache_key
         if self.supports_prompt_cache and prompt_cache_retention:
@@ -318,8 +350,8 @@ class OpenAICompatibleModelClient:
                 break
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
-                if exc.code in RETRYABLE_HTTP_CODES and attempt < attempts - 1:
-                    time.sleep(_http_retry_delay(exc, attempt))
+                if _is_retryable_http_error(exc, body) and attempt < attempts - 1:
+                    time.sleep(_http_retry_delay(exc, attempt, body))
                     continue
                 raise RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}") from exc
             except (urllib.error.URLError, RemoteDisconnected, TimeoutError) as exc:
@@ -336,17 +368,17 @@ class OpenAICompatibleModelClient:
         # 这里两种都接住，并尽量统一抽取文本和 usage/cache 元数据。
         if content_type.startswith("text/event-stream") or body_text.lstrip().startswith("data:"):
             text, response_data = _extract_openai_response_from_sse(body_text)
-            if isinstance(response_data, dict) and response_data:
-                # 这些元数据会一路传回 runtime，进入 trace 和 report，
-                # 用来观察 prompt cache 是否真的命中。
-                self.last_completion_metadata = {
-                    "prompt_cache_supported": self.supports_prompt_cache,
-                    "prompt_cache_key": prompt_cache_key,
-                    "prompt_cache_retention": prompt_cache_retention,
-                    **_extract_usage_cache_details(response_data),
-                }
             if text:
-                return text
+                return ModelCompletion(
+                    text=text,
+                    metadata={
+                        "prompt_cache_supported": self.supports_prompt_cache,
+                        "prompt_cache_key": prompt_cache_key,
+                        "prompt_cache_retention": prompt_cache_retention,
+                        "request_attempts": attempt + 1,
+                        **_extract_usage_cache_details(response_data if isinstance(response_data, dict) else {}),
+                    },
+                )
             raise RuntimeError("OpenAI-compatible error: could not extract text from event stream response")
 
         try:
@@ -357,14 +389,17 @@ class OpenAICompatibleModelClient:
             ) from exc
         if data.get("error"):
             raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
-        self.last_completion_metadata = {
+        metadata = {
             "prompt_cache_supported": self.supports_prompt_cache,
             "prompt_cache_key": prompt_cache_key,
             "prompt_cache_retention": prompt_cache_retention,
             "request_attempts": attempt + 1,
             **_extract_usage_cache_details(data),
         }
-        return _extract_openai_text(data)
+        text = _extract_openai_text(data)
+        if not text:
+            raise RuntimeError("OpenAI-compatible error: could not extract text from response")
+        return ModelCompletion(text=text, metadata=metadata)
 
 
 def _extract_anthropic_text(data):
@@ -403,13 +438,11 @@ class AnthropicCompatibleModelClient:
         self.timeout = timeout
         self.attempts = max(1, int(attempts))
         self.supports_prompt_cache = False
-        self.last_completion_metadata = {}
 
     def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
         # 为了保持统一接口，runtime 仍然会传缓存参数进来；
         # 这里只是显式丢弃，因为当前 Anthropic-compatible 路径没有接缓存复用。
         del prompt_cache_key, prompt_cache_retention
-        self.last_completion_metadata = {}
         payload = {
             "model": self.model,
             "messages": [
@@ -451,8 +484,8 @@ class AnthropicCompatibleModelClient:
                 break
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
-                if exc.code in RETRYABLE_HTTP_CODES and attempt < attempts - 1:
-                    time.sleep(_http_retry_delay(exc, attempt))
+                if _is_retryable_http_error(exc, body) and attempt < attempts - 1:
+                    time.sleep(_http_retry_delay(exc, attempt, body))
                     continue
                 raise RuntimeError(f"Anthropic-compatible request failed with HTTP {exc.code}: {body}") from exc
             except (urllib.error.URLError, RemoteDisconnected, TimeoutError) as exc:
@@ -473,11 +506,11 @@ class AnthropicCompatibleModelClient:
             ) from exc
         if data.get("error"):
             raise RuntimeError(f"Anthropic-compatible error: {data['error']}")
-        self.last_completion_metadata = {
+        metadata = {
             "request_attempts": attempt + 1,
             **_extract_anthropic_usage(data),
         }
         text = _extract_anthropic_text(data)
         if text:
-            return text
+            return ModelCompletion(text=text, metadata=metadata)
         raise RuntimeError("Anthropic-compatible error: could not extract text from response")

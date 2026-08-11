@@ -18,7 +18,12 @@ from CodeY.evaluation.real_skill_routing import (
     score_predictions,
     validate_skill_descriptions,
 )
-from CodeY.providers.clients import OpenAICompatibleModelClient, _http_retry_delay
+from CodeY.providers.clients import (
+    AnthropicCompatibleModelClient,
+    OpenAICompatibleModelClient,
+    _http_retry_delay,
+    _is_retryable_http_error,
+)
 from CodeY.skills.router import SkillRouter
 from scripts.run_real_skill_routing_experiment import (
     EXPERIMENT_PROTOCOL_VERSION,
@@ -111,10 +116,18 @@ def test_skill_descriptions_follow_seven_activation_rules():
 
 def test_materialized_documents_are_valid_project_skills(tmp_path):
     dataset = load_dataset()
-    materialize_skill_documents(dataset, tmp_path / "skills")
+    skills_root = materialize_skill_documents(dataset, tmp_path / "skills")
     router = SkillRouter(tmp_path)
     assert len(router.skills) == 100
     assert {skill.name for skill in router.skills} == {skill.id for skill in dataset.skills}
+    for path in skills_root.glob("*/SKILL.md"):
+        frontmatter = path.read_text(encoding="utf-8").split("---", 2)[1]
+        keys = {
+            line.split(":", 1)[0].strip()
+            for line in frontmatter.splitlines()
+            if line.strip()
+        }
+        assert keys == {"name", "description"}
 
 
 def test_structured_index_is_smaller_but_preserves_every_skill_id():
@@ -180,10 +193,26 @@ def test_rate_limit_retry_uses_retry_after_or_bounded_backoff():
     origin_timeout = urllib.error.HTTPError(
         "https://example.test", 524, "origin timeout", {}, None
     )
+    transient_not_found = urllib.error.HTTPError(
+        "https://example.test", 404, "not found", {}, None
+    )
+    body_backoff = urllib.error.HTTPError(
+        "https://example.test", 502, "bad gateway", {}, None
+    )
     assert _http_retry_delay(explicit, 0) == 7.0
     assert _http_retry_delay(fallback, 0) == 10.0
     assert _http_retry_delay(fallback, 10) == 60.0
     assert _http_retry_delay(origin_timeout, 0) == 120.0
+    assert _http_retry_delay(transient_not_found, 0) == 180.0
+    assert _http_retry_delay(body_backoff, 0, '{"retry_after":60}') == 60.0
+
+
+def test_only_bare_proxy_404_is_retried():
+    not_found = urllib.error.HTTPError(
+        "https://example.test", 404, "not found", {}, None
+    )
+    assert _is_retryable_http_error(not_found, "404 page not found") is True
+    assert _is_retryable_http_error(not_found, '{"error":"model not found"}') is False
 
 
 def test_openai_compatible_timeout_is_wrapped(monkeypatch):
@@ -203,3 +232,45 @@ def test_openai_compatible_timeout_is_wrapped(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", raise_timeout)
     with pytest.raises(RuntimeError, match="Could not reach"):
         client.complete("prompt", max_new_tokens=16)
+
+
+def test_anthropic_compatible_uses_claude_cli_user_agent(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+
+        def read(self):
+            return json.dumps(
+                {
+                    "content": [{"type": "text", "text": "OK"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            ).encode("utf-8")
+
+    def capture_request(request, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", capture_request)
+    client = AnthropicCompatibleModelClient(
+        model="claude-opus-5[1M]",
+        base_url="https://example.test/v1",
+        api_key="test-key",
+        temperature=0.0,
+        timeout=3,
+        attempts=1,
+    )
+
+    completion = client.complete("prompt", max_new_tokens=16)
+
+    assert completion.text == "OK"
+    assert captured["request"].get_header("User-agent") == (
+        "claude-cli/2.1.218 (external, cli)"
+    )
+    assert captured["timeout"] == 3

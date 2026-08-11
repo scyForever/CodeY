@@ -42,6 +42,7 @@ readme_intro_locked/
 
 # Local docs not intended for publication
 docs/*
+!docs/01-Agent架构设计.md
 !docs/evolution-hybrid-risk-register.md
 
 # OS files

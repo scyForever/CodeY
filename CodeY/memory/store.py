@@ -1,6 +1,6 @@
 """多步 agent 运行时使用的轻量工作记忆。
 
-session history 负责保存完整事件流；这个模块只保存更小的一层工作集：
+session transcript 负责保存完整事件流；这个模块只保存更小的一层工作集：
 当前任务摘要、最近接触的文件、文件短摘要，以及少量跨轮笔记。
 这样下一轮 prompt 还能接上上一轮，但不会被整段历史塞满。
 """
@@ -15,6 +15,7 @@ from ..context.workspace import clip, now
 WORKING_FILE_LIMIT = 8
 EPISODIC_NOTE_LIMIT = 12
 FILE_SUMMARY_LIMIT = 6
+MEMORY_SCHEMA_VERSION = 2
 
 DURABLE_TOPIC_DEFAULTS = {
     "project-conventions": {
@@ -43,16 +44,15 @@ DURABLE_TOPIC_DEFAULTS = {
 def default_memory_state():
     # 用一个小而结构化的状态，而不是一大段自由文本摘要。
     return {
+        "schema_version": MEMORY_SCHEMA_VERSION,
         "working": {
             "task_summary": "",
             "recent_files": [],
         },
         "episodic_notes": [],
         "file_summaries": {},
-        "task": "",
-        "files": [],
-        "notes": [],
         "next_note_index": 0,
+        "durable_topics": [],
     }
 
 
@@ -334,16 +334,22 @@ def _normalize_note(note, index):
 def normalize_memory_state(state, workspace_root=None):
     if state is None:
         state = default_memory_state()
-    elif not isinstance(state, dict):
+    if not isinstance(state, dict):
         raise TypeError("memory state must be a mapping")
+    required = {
+        "schema_version",
+        "working",
+        "episodic_notes",
+        "file_summaries",
+        "next_note_index",
+        "durable_topics",
+    }
+    if state.get("schema_version") != MEMORY_SCHEMA_VERSION or set(state) != required:
+        raise ValueError(f"memory state must use schema_version {MEMORY_SCHEMA_VERSION}")
 
-    # 规范化层的作用，是把“磁盘里可能长得不太一样的旧状态”
-    # 统一整理成当前 runtime 可直接使用的紧凑结构。
-    working = state.get("working")
-    if not isinstance(working, dict):
-        working = {}
-    working.setdefault("task_summary", "")
-    working.setdefault("recent_files", [])
+    working = state["working"]
+    if not isinstance(working, dict) or set(working) != {"task_summary", "recent_files"}:
+        raise ValueError("memory working state is invalid")
     working["task_summary"] = clip(str(working.get("task_summary", "")).strip(), 300)
     working["recent_files"] = _dedupe_preserve_order(
         [
@@ -354,52 +360,30 @@ def normalize_memory_state(state, workspace_root=None):
     )[-WORKING_FILE_LIMIT:]
     state["working"] = working
 
-    if not str(working["task_summary"]).strip() and state.get("task"):
-        working["task_summary"] = clip(str(state.get("task", "")).strip(), 300)
-    if not working["recent_files"] and state.get("files"):
-        working["recent_files"] = _dedupe_preserve_order(
-            [
-                canonicalize_path(path, workspace_root)
-                for path in _ensure_list(state.get("files", []))
-                if str(path).strip()
-            ]
-        )[-WORKING_FILE_LIMIT:]
-
-    episodic_notes = state.get("episodic_notes")
+    episodic_notes = state["episodic_notes"]
     if not isinstance(episodic_notes, list):
-        episodic_notes = []
-
-    if not episodic_notes and state.get("notes"):
-        episodic_notes = [
-            _normalize_note(note, index)
-            for index, note in enumerate(_ensure_list(state.get("notes", [])))
-            if str(note).strip()
-        ]
-    else:
-        normalized_notes = []
-        for index, note in enumerate(episodic_notes):
-            if isinstance(note, str) and not str(note).strip():
-                continue
-            normalized_notes.append(_normalize_note(note, index))
-        episodic_notes = normalized_notes
+        raise ValueError("memory episodic_notes must be a list")
+    normalized_notes = []
+    for index, note in enumerate(episodic_notes):
+        if not isinstance(note, dict):
+            raise ValueError("memory notes must use the structured note schema")
+        normalized_notes.append(_normalize_note(note, index))
+    episodic_notes = normalized_notes
     episodic_notes = episodic_notes[-EPISODIC_NOTE_LIMIT:]
     state["episodic_notes"] = episodic_notes
 
-    file_summaries = state.get("file_summaries")
+    file_summaries = state["file_summaries"]
     if not isinstance(file_summaries, dict):
-        file_summaries = {}
+        raise ValueError("memory file_summaries must be a mapping")
     normalized_file_summaries = {}
     for path, summary in file_summaries.items():
         path = canonicalize_path(path, workspace_root)
-        if isinstance(summary, dict):
-            text = clip(str(summary.get("summary", "")).strip(), 500)
-            created_at = str(summary.get("created_at", "")).strip() or now()
-            freshness = summary.get("freshness")
-            freshness = None if freshness in (None, "") else str(freshness).strip() or None
-        else:
-            text = clip(str(summary).strip(), 500)
-            created_at = now()
-            freshness = None
+        if not isinstance(summary, dict) or set(summary) != {"summary", "created_at", "freshness"}:
+            raise ValueError("memory file summary schema is invalid")
+        text = clip(str(summary.get("summary", "")).strip(), 500)
+        created_at = str(summary.get("created_at", "")).strip() or now()
+        freshness = summary.get("freshness")
+        freshness = None if freshness in (None, "") else str(freshness).strip() or None
         if not path or not text:
             continue
         normalized_file_summaries[path] = {
@@ -409,15 +393,12 @@ def normalize_memory_state(state, workspace_root=None):
         }
     state["file_summaries"] = normalized_file_summaries
 
-    next_note_index = state.get("next_note_index")
+    next_note_index = state["next_note_index"]
     if not isinstance(next_note_index, int) or next_note_index < 0:
-        next_note_index = 0
+        raise ValueError("memory next_note_index is invalid")
     max_index = max([note["note_index"] for note in episodic_notes], default=-1)
     state["next_note_index"] = max(next_note_index, max_index + 1)
 
-    state["task"] = working["task_summary"]
-    state["files"] = list(working["recent_files"])
-    state["notes"] = [note["text"] for note in episodic_notes]
     durable_root = Path(workspace_root) / ".codey" / "memory" if workspace_root is not None else None
     durable_store = DurableMemoryStore(durable_root) if durable_root is not None else None
     state["durable_topics"] = durable_store.topic_slugs() if durable_store is not None else []
@@ -427,7 +408,6 @@ def normalize_memory_state(state, workspace_root=None):
 def set_task_summary(state, summary, workspace_root=None):
     state = normalize_memory_state(state, workspace_root)
     state["working"]["task_summary"] = clip(str(summary).strip(), 300)
-    state["task"] = state["working"]["task_summary"]
     return state
 
 
@@ -439,7 +419,6 @@ def remember_file(state, path, workspace_root=None):
     files = [item for item in state["working"]["recent_files"] if item != path]
     files.append(path)
     state["working"]["recent_files"] = files[-WORKING_FILE_LIMIT:]
-    state["files"] = list(state["working"]["recent_files"])
     return state
 
 
@@ -465,7 +444,6 @@ def append_note(state, text, tags=(), source="", created_at=None, workspace_root
     notes = [item for item in state["episodic_notes"] if item["text"] != note["text"]]
     notes.append(note)
     state["episodic_notes"] = notes[-EPISODIC_NOTE_LIMIT:]
-    state["notes"] = [item["text"] for item in state["episodic_notes"]]
     return state
 def set_file_summary(state, path, summary, workspace_root=None):
     state = normalize_memory_state(state, workspace_root)
