@@ -43,6 +43,12 @@ from ..context.workspace import IGNORED_PATH_NAMES, MAX_TRANSCRIPT_CHARS, Worksp
 from ..skills.hooks import HookManager
 from ..skills.feedback import SkillFeedbackStore
 from ..skills.router import RouteMatch, SkillRouter, SkillSelection
+from ..skills.semantic import (
+    DEFAULT_EMBEDDING_BATCH_SIZE,
+    DEFAULT_SEMANTIC_MIN_MARGIN,
+    DEFAULT_SEMANTIC_MIN_SIMILARITY,
+    SkillSemanticIndex,
+)
 
 DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
 DEFAULT_FEATURE_FLAGS = {
@@ -95,6 +101,11 @@ class CodeYAgent:
         evolution_llm_client=None,
         skill_model_client=None,
         skill_selection_max_new_tokens=256,
+        skill_embedding_client=None,
+        skill_semantic_index=None,
+        skill_semantic_min_similarity=DEFAULT_SEMANTIC_MIN_SIMILARITY,
+        skill_semantic_min_margin=DEFAULT_SEMANTIC_MIN_MARGIN,
+        skill_embedding_batch_size=DEFAULT_EMBEDDING_BATCH_SIZE,
         summary_model_client=None,
         summary_recent_turns=DEFAULT_RECENT_TURNS,
         summary_max_new_tokens=512,
@@ -153,6 +164,24 @@ class CodeYAgent:
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
         self.skill_mode = str(skill_mode or "auto")
         self.skill_router = SkillRouter(self.root, mode=self.skill_mode)
+        self.skill_embedding_client = skill_embedding_client
+        if skill_semantic_index is not None:
+            self.skill_semantic_index = skill_semantic_index
+            if self.skill_embedding_client is None:
+                self.skill_embedding_client = getattr(skill_semantic_index, "embedding_client", None)
+        elif self.skill_embedding_client is not None:
+            self.skill_semantic_index = SkillSemanticIndex(
+                self.skill_embedding_client,
+                min_similarity=skill_semantic_min_similarity,
+                min_margin=skill_semantic_min_margin,
+                batch_size=skill_embedding_batch_size,
+            )
+        else:
+            self.skill_semantic_index = None
+        self.last_semantic_skill_routing = {
+            "status": "not_invoked",
+            "enabled": self.skill_semantic_index is not None,
+        }
         self.skill_feedback_store = SkillFeedbackStore(self.root / ".codey" / "skill-routing")
         self.hook_manager = HookManager(hook_callbacks)
         self.current_route = RouteMatch()
@@ -183,8 +212,9 @@ class CodeYAgent:
             recent_turns=summary_recent_turns,
             max_chars=summary_max_chars,
         )
+        resume_summary_interrupted = False
         if session is not None:
-            self.conversation_summarizer.recover_persisted_pending()
+            resume_summary_interrupted = self.conversation_summarizer.recover_persisted_pending()
         self.resume_state = self.evaluate_resume_state()
         self.session_path = self.save_session()
         self.current_task_state = None
@@ -204,6 +234,8 @@ class CodeYAgent:
         self._ask_lock = threading.Lock()
         self._used_graph_thread_ids = set()
         self._active_turn_id = ""
+        if resume_summary_interrupted:
+            self.conversation_summarizer.schedule()
 
     @classmethod
     def from_session(cls, model_client, workspace, session_store, session_id, **kwargs):
@@ -362,9 +394,13 @@ class CodeYAgent:
         )
 
     def route_task(self, user_message, *, run_id, task_id):
+        self.last_semantic_skill_routing = {
+            "status": "not_invoked",
+            "enabled": self.skill_semantic_index is not None,
+        }
         route = self.skill_router.route(
             user_message,
-            selector=self.select_skill_from_descriptions,
+            selector=self.select_skill,
         )
         event_id = self.skill_feedback_store.start(
             session_id=self.session["id"],
@@ -375,6 +411,62 @@ class CodeYAgent:
         )
         self.current_route = replace(route, routing_event_id=event_id)
         return self.current_route
+
+    def select_skill(self, request, skills, candidates):
+        if self.skill_semantic_index is None:
+            self.last_semantic_skill_routing = {
+                "status": "disabled",
+                "enabled": False,
+            }
+            return self.select_skill_from_descriptions(request, skills, candidates)
+
+        excluded = tuple(
+            candidate.skill_name
+            for candidate in candidates
+            if candidate.matched_near_misses
+        )
+        try:
+            match = self.skill_semantic_index.select(
+                self.redact_text(request),
+                skills,
+                excluded_skill_names=excluded,
+            )
+        except Exception as exc:
+            self.last_semantic_skill_routing = {
+                "status": "error",
+                "enabled": True,
+                "accepted": False,
+                "error_type": type(exc).__name__,
+            }
+            fallback = self.select_skill_from_descriptions(request, skills, candidates)
+            return replace(
+                fallback,
+                reason=(
+                    f"{fallback.reason} Semantic vector routing failed with "
+                    f"{type(exc).__name__}; used the Description-model fallback."
+                ).strip(),
+            )
+
+        self.last_semantic_skill_routing = {
+            "enabled": True,
+            **match.to_dict(),
+        }
+        if match.accepted:
+            return SkillSelection(
+                skill_name=match.skill_name,
+                confidence=max(0.0, min(1.0, match.score)),
+                reason=match.reason,
+                source="semantic_vector",
+            )
+
+        fallback = self.select_skill_from_descriptions(request, skills, candidates)
+        return replace(
+            fallback,
+            reason=(
+                f"{fallback.reason} Semantic vector route was not accepted "
+                f"({match.status}); used the Description-model fallback."
+            ).strip(),
+        )
 
     def select_skill_from_descriptions(self, request, skills, candidates):
         catalog = [
@@ -421,7 +513,10 @@ class CodeYAgent:
         return self.current_route.route_context
 
     def route_status(self):
-        return self.skill_router.status(self.current_route)
+        return {
+            **self.skill_router.status(self.current_route),
+            "semantic_route": dict(self.last_semantic_skill_routing),
+        }
 
     def complete_skill_routing_feedback(self, task_state):
         event_id = str(getattr(task_state, "routing_event_id", "") or "")
@@ -676,6 +771,7 @@ class CodeYAgent:
                 "tool_signature": self.prefix_state.tool_signature,
                 "skill_fingerprint": self.prefix_state.skill_fingerprint,
                 "skill_route": self.current_route.to_dict(),
+                "skill_semantic_route": dict(self.last_semantic_skill_routing),
                 "workspace_changed": refresh["workspace_changed"],
                 "prefix_changed": refresh["prefix_changed"],
                 "prompt_cache_supported": bool(getattr(self.model_client, "supports_prompt_cache", False)),
@@ -951,6 +1047,7 @@ class CodeYAgent:
             "cognitive_loop": dict(self.last_cognitive_loop),
             "redacted_env": self.detected_secret_env_summary(),
             "skill_route": self.current_route.to_dict(),
+            "skill_semantic_route": dict(self.last_semantic_skill_routing),
             "session_context": dict(self.session.get("session_context", {})),
             "conversation_summary": dict(self.conversation_summary_state()),
             "fork_summary": dict(task_state.fork_summary),
@@ -1016,6 +1113,8 @@ class CodeYAgent:
             feature_flags={**self.feature_flags, "self_evolution": False},
             allowed_tools=self.allowed_tools,
             skill_mode=self.skill_mode,
+            skill_embedding_client=self.skill_embedding_client,
+            skill_semantic_index=self.skill_semantic_index,
             max_fork_branches=self.max_fork_branches,
             max_parallel_branches=self.max_parallel_branches,
             allow_persistent_graph_checkpointer=self.allow_persistent_graph_checkpointer,

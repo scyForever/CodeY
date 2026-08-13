@@ -131,13 +131,69 @@ Fork 生命周期事件：
 - Join 会等待所有分支进入终态。同步 provider 调用无法被 Python 安全地强制取消，因此当前不提供会留下后台任务的伪组级 timeout；生产必须为 provider HTTP 和工具分别配置有界 timeout。
 - 多个可写 Agent 不属于当前架构。若未来开放，必须使用独立 worktree 或资源租约与显式合并协议。
 
-## 8. 代码映射
+## 8. 异步会话摘要
+
+摘要不阻塞主 AgentLoop 的最终回答。每个完整 turn 在 `finalize` 后只提交刷新意图，真正的 LLM 调用由 `AsyncConversationSummarizer` 的 daemon worker 完成：
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Pending: schedule / reserve generation
+    Pending --> Running: start daemon worker
+    Running --> Committed: JSON valid + coverage/hash/generation/CAS valid
+    Running --> Failed: provider/parse/start/CAS failure
+    Running --> Pending: transcript advanced while running
+    Failed --> Idle: keep uncovered transcript fallback
+    Committed --> Idle
+    Pending --> Running: automatic catch-up generation
+```
+
+关键不变量：
+
+- 同一 session epoch 最多一个活动 worker；重复 schedule 合并，不产生同 coverage 的并发摘要。
+- worker 运行期间 transcript 增长时只记录补跑意图，当前 worker 终止后再为最新 coverage 建新 generation。
+- 提交必须同时满足 epoch、pending generation、coverage、source hash、transcript prefix 和 session revision CAS。
+- 失败、pending 或旧摘要未覆盖的 transcript 保留原文进入 ContextManager，不把“正在算”误当成“已经记住”。
+- resume 会把持久化但未完成的 pending 标为中断错误，并立即重排；CLI close 只做有界等待，不无限阻塞退出。
+
+## 9. Skill 向量语义路由
+
+Skill 粗路由采用“确定性高精度边界 + 向量召回判定 + LLM 兜底”，Task 细路由仍只在已选 Skill 内执行：
+
+```mermaid
+flowchart TD
+    R["用户请求"] --> E{"显式 /skill-name?"}
+    E -->|是| S["选择 Skill"]
+    E -->|否| L{"唯一 activation phrase 命中且无 near-miss?"}
+    L -->|是| S
+    L -->|否| V{"已配置 Embedding?"}
+    V -->|否| M["Description LLM selector"]
+    V -->|是| X["脱敏请求 + 精确余弦检索"]
+    X --> N["移除 near-miss 命中的 Skill"]
+    N --> A{"Top-1 达阈值且 Top-2 margin 足够?"}
+    A -->|是| S
+    A -->|否或异常| M
+    M --> G{"合法 Skill + confidence >= 0.5 + 无 near-miss?"}
+    G -->|是| S
+    G -->|否| Z["空路由"]
+    S --> T["Skill 内 Task route + 渐进加载"]
+```
+
+索引文本只包含 Skill 名称、正向 Description、activation phrase 和 Task label/trigger，不把 near-miss 当成相似语义样本。索引由 Embedding client 身份与文本内容生成 fingerprint，按批构建并在父 Agent 与同质 Fork 之间共享；当前规模使用进程内精确 cosine，避免引入向量数据库和持久化一致性负担。向量只有在 similarity 与 margin 同时过线时才直接激活，否则交给原有 Description LLM selector；显式 near-miss 在向量候选和最终 selector 结果上都是硬否决。
+
+Embedding 后端为可注入协议，内置 OpenAI-compatible `/v1/embeddings` 与 Ollama `/api/embed` 适配器。默认关闭，启用后 Skill 正向描述和脱敏请求会发送给配置的服务；原始向量不持久化，report/prompt metadata 只保存可审计的模型、维数、fingerprint、分数、margin、状态和错误类型。
+
+## 10. 代码映射
 
 | 模块 | 职责 |
 | --- | --- |
 | `CodeY/core/agent_loop.py` | StateGraph 模板和动态条件路由 |
 | `CodeY/core/fork.py` | ForkCoordinator、BranchSpec、BranchResult、Join |
 | `CodeY/core/runtime.py` | Agent 隔离、provider factory、实例锁 |
+| `CodeY/context/transcript.py` | 异步摘要调度、coverage/hash/generation/CAS 提交与失败回退 |
+| `CodeY/skills/router.py` | 显式/词法/near-miss 边界与 Task 渐进路由 |
+| `CodeY/skills/semantic.py` | Skill 语义文档、fingerprint cache、精确余弦与阈值/margin 判定 |
+| `CodeY/providers/embeddings.py` | OpenAI-compatible 与 Ollama Embedding 协议适配 |
 | `CodeY/tools/registry.py` | `fork_join` schema、校验和注册 |
 | `CodeY/storage/run.py` | 分支结果原子落盘 |
 | `CodeY/core/task_state.py` | 图和 Fork 的可恢复摘要状态 |

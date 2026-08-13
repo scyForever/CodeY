@@ -33,6 +33,22 @@ def test_cli_exposes_summary_and_skill_selector_controls():
             "selector-model",
             "--skill-selector-max-new-tokens",
             "300",
+            "--skill-embedding-provider",
+            "openai",
+            "--skill-embedding-model",
+            "embedding-model",
+            "--skill-embedding-base-url",
+            "https://embeddings.example/v1",
+            "--skill-embedding-timeout",
+            "15.5",
+            "--skill-embedding-dimensions",
+            "512",
+            "--skill-semantic-threshold",
+            "0.62",
+            "--skill-semantic-margin",
+            "0.08",
+            "--skill-embedding-batch-size",
+            "64",
         ]
     )
 
@@ -43,6 +59,14 @@ def test_cli_exposes_summary_and_skill_selector_controls():
     assert args.summary_flush_timeout == 12.5
     assert args.skill_selector_model == "selector-model"
     assert args.skill_selector_max_new_tokens == 300
+    assert args.skill_embedding_provider == "openai"
+    assert args.skill_embedding_model == "embedding-model"
+    assert args.skill_embedding_base_url == "https://embeddings.example/v1"
+    assert args.skill_embedding_timeout == 15.5
+    assert args.skill_embedding_dimensions == 512
+    assert args.skill_semantic_threshold == 0.62
+    assert args.skill_semantic_margin == 0.08
+    assert args.skill_embedding_batch_size == 64
 
 
 def test_versioned_context_and_recovery_artifacts_execute_end_to_end(tmp_path):

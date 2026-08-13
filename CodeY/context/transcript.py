@@ -267,6 +267,8 @@ class AsyncConversationSummarizer:
         self.recent_turns = max(1, int(recent_turns))
         self.max_chars = max(200, int(max_chars))
         self._threads = {}
+        self._active_jobs = {}
+        self._reschedule_epochs = set()
         self._threads_lock = threading.Lock()
         self._epoch = 0
 
@@ -274,6 +276,7 @@ class AsyncConversationSummarizer:
         """Invalidate in-flight jobs without waiting for provider I/O."""
         with self._threads_lock:
             self._epoch += 1
+            self._reschedule_epochs.clear()
             return self._epoch
 
     def recover_persisted_pending(self):
@@ -315,6 +318,12 @@ class AsyncConversationSummarizer:
             committed = summary_state["committed"]
             if cutoff <= committed["covered_through_sequence"]:
                 return None
+            with self._threads_lock:
+                active = self._active_jobs.get(self._epoch)
+                if active is not None:
+                    if cutoff > active.covered_through_sequence:
+                        self._reschedule_epochs.add(self._epoch)
+                    return active.generation
             generation = max(
                 committed["generation"],
                 int((summary_state.get("pending") or {}).get("generation", 0)),
@@ -334,6 +343,18 @@ class AsyncConversationSummarizer:
                 previous_summary=committed["text"],
                 new_entries=new_entries,
             )
+            with self._threads_lock:
+                self._active_jobs[job.epoch] = job
+            previous_pending = (
+                dict(summary_state["pending"])
+                if summary_state.get("pending") is not None
+                else None
+            )
+            previous_error = (
+                dict(summary_state["last_error"])
+                if summary_state.get("last_error") is not None
+                else None
+            )
             summary_state["pending"] = {
                 "generation": generation,
                 "covered_through_sequence": cutoff,
@@ -341,7 +362,15 @@ class AsyncConversationSummarizer:
                 "started_at": now(),
             }
             summary_state["last_error"] = None
-            self.agent.save_session()
+            try:
+                self.agent.save_session()
+            except Exception:
+                summary_state["pending"] = previous_pending
+                summary_state["last_error"] = previous_error
+                with self._threads_lock:
+                    if self._active_jobs.get(job.epoch) == job:
+                        self._active_jobs.pop(job.epoch, None)
+                raise
 
         thread = threading.Thread(
             target=self._run,
@@ -351,7 +380,16 @@ class AsyncConversationSummarizer:
         )
         with self._threads_lock:
             self._threads[(job.epoch, job.generation)] = thread
-        thread.start()
+        try:
+            thread.start()
+        except Exception as exc:
+            with self._threads_lock:
+                self._threads.pop((job.epoch, job.generation), None)
+                if self._active_jobs.get(job.epoch) == job:
+                    self._active_jobs.pop(job.epoch, None)
+                self._reschedule_epochs.discard(job.epoch)
+            self._fail(job, exc)
+            return None
         return generation
 
     def wait(self, timeout=None):
@@ -378,6 +416,21 @@ class AsyncConversationSummarizer:
         except Exception as exc:
             self._fail(job, exc)
         finally:
+            with self._threads_lock:
+                if self._active_jobs.get(job.epoch) == job:
+                    self._active_jobs.pop(job.epoch, None)
+                reschedule = (
+                    job.epoch == self._epoch
+                    and job.epoch in self._reschedule_epochs
+                )
+                self._reschedule_epochs.discard(job.epoch)
+            if reschedule:
+                try:
+                    self.schedule()
+                except Exception:
+                    # A later run will retry from committed coverage. The daemon
+                    # must never make the foreground request fail during teardown.
+                    pass
             with self._threads_lock:
                 self._threads.pop((job.epoch, job.generation), None)
 

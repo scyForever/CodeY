@@ -7,6 +7,12 @@ from .clients import (
     OllamaModelClient,
     OpenAICompatibleModelClient,
 )
+from .embeddings import (
+    EmbeddingBatch,
+    FakeEmbeddingClient,
+    OllamaEmbeddingClient,
+    OpenAICompatibleEmbeddingClient,
+)
 
 __all__ = [
     "AnthropicCompatibleModelClient",
@@ -14,4 +20,8 @@ __all__ = [
     "ModelCompletion",
     "OllamaModelClient",
     "OpenAICompatibleModelClient",
+    "EmbeddingBatch",
+    "FakeEmbeddingClient",
+    "OllamaEmbeddingClient",
+    "OpenAICompatibleEmbeddingClient",
 ]
