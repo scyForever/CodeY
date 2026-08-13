@@ -6,6 +6,12 @@ from .providers.clients import (
     OllamaModelClient,
     OpenAICompatibleModelClient,
 )
+from .providers.embeddings import (
+    EmbeddingBatch,
+    FakeEmbeddingClient,
+    OllamaEmbeddingClient,
+    OpenAICompatibleEmbeddingClient,
+)
 from .core.runtime import CodeYAgent
 from .evolution import CognitiveLoop, EvolutionLLMConfig, EvolutionThresholds
 from .storage.session import SessionStore
@@ -27,6 +33,10 @@ __all__ = [
     "main",
     "OllamaModelClient",
     "OpenAICompatibleModelClient",
+    "EmbeddingBatch",
+    "FakeEmbeddingClient",
+    "OllamaEmbeddingClient",
+    "OpenAICompatibleEmbeddingClient",
     "HookManager",
     "RouteMatch",
     "SessionStartEvent",

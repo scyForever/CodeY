@@ -153,6 +153,53 @@ def test_reset_invalidates_old_generation_without_clearing_new_pending_job(tmp_p
     assert agent.conversation_summary_state()["last_error"] is None
 
 
+def test_repeated_refresh_coalesces_to_one_worker_and_catches_up_latest_turns(tmp_path):
+    client = ControlledSummaryClient(
+        ['{"summary":"first coverage"}', '{"summary":"latest coverage"}']
+    )
+    agent = build_agent(tmp_path, client, recent_turns=1)
+    record_turn(agent, "turn-1", "one", "one answer")
+    record_turn(agent, "turn-2", "two", "two answer")
+
+    assert agent.refresh_conversation_summary_async() == 1
+    assert client.started[0].wait(timeout=5)
+
+    record_turn(agent, "turn-3", "three", "three answer")
+    assert agent.refresh_conversation_summary_async() == 1
+    assert not client.started[1].is_set()
+
+    client.release[0].set()
+    assert client.started[1].wait(timeout=5)
+    client.release[1].set()
+    assert agent.wait_for_conversation_summary(timeout=5)
+
+    committed = agent.conversation_summary_state()["committed"]
+    assert committed["generation"] == 2
+    assert committed["covered_through_sequence"] == 4
+    assert committed["text"] == "latest coverage"
+
+
+def test_summary_thread_start_failure_clears_pending_state(tmp_path, monkeypatch):
+    agent = build_agent(
+        tmp_path,
+        FakeModelClient(['{"summary":"unused"}']),
+        recent_turns=1,
+    )
+    record_turn(agent, "turn-1", "one", "one answer")
+    record_turn(agent, "turn-2", "two", "two answer")
+
+    def fail_start(self):
+        del self
+        raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+
+    assert agent.refresh_conversation_summary_async() is None
+    state = agent.conversation_summary_state()
+    assert state["pending"] is None
+    assert state["last_error"]["error_type"] == "RuntimeError"
+
+
 def test_close_cancels_pending_summary_after_bounded_wait(tmp_path):
     client = ControlledSummaryClient(['{"summary":"too late"}'])
     agent = build_agent(tmp_path, client, recent_turns=1)
@@ -171,7 +218,7 @@ def test_close_cancels_pending_summary_after_bounded_wait(tmp_path):
     assert agent.conversation_summary_state()["committed"]["generation"] == 0
 
 
-def test_resume_clears_persisted_summary_job_without_a_worker(tmp_path):
+def test_resume_restarts_persisted_summary_job_without_a_worker(tmp_path):
     agent = build_agent(tmp_path, FakeModelClient([]), recent_turns=1)
     record_turn(agent, "turn-1", "old user", "old answer")
     record_turn(agent, "turn-2", "recent user", "recent answer")
@@ -186,7 +233,7 @@ def test_resume_clears_persisted_summary_job_without_a_worker(tmp_path):
 
     resumed = CodeYAgent.from_session(
         model_client=FakeModelClient([]),
-        summary_model_client=FakeModelClient([]),
+        summary_model_client=FakeModelClient(['{"summary":"resumed summary"}']),
         summary_recent_turns=1,
         workspace=agent.workspace,
         session_store=agent.session_store,
@@ -196,9 +243,12 @@ def test_resume_clears_persisted_summary_job_without_a_worker(tmp_path):
         feature_flags={"self_evolution": False},
     )
 
+    assert resumed.wait_for_conversation_summary(timeout=5)
     state = resumed.conversation_summary_state()
     assert state["pending"] is None
-    assert state["last_error"]["generation"] == 1
-    assert state["last_error"]["error_type"] == "SummaryInterruptedOnResume"
+    assert state["last_error"] is None
+    assert state["committed"]["generation"] == 2
+    assert state["committed"]["covered_through_sequence"] == 2
+    assert state["committed"]["text"] == "resumed summary"
     persisted = resumed.session_store.load(resumed.session["id"])
     assert persisted["conversation_summary"] == state

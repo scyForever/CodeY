@@ -367,7 +367,11 @@ class SkillRouter:
                     return None, (), SkillSelection(
                         confidence=selection.confidence,
                         reason="Skill selector returned an unknown Skill",
-                        source="description_model_error",
+                        source=(
+                            "semantic_vector_error"
+                            if selection.source == "semantic_vector"
+                            else "description_model_error"
+                        ),
                     )
                 evidence = next(
                     candidate
@@ -378,9 +382,16 @@ class SkillRouter:
                     return None, (), SkillSelection(
                         confidence=selection.confidence,
                         reason="selected Skill matched a Description near-miss exclusion",
-                        source="description_model_rejected",
+                        source=(
+                            "semantic_vector_rejected"
+                            if selection.source == "semantic_vector"
+                            else "description_model_rejected"
+                        ),
                     )
-                if selection.confidence < MIN_SELECTOR_CONFIDENCE:
+                if (
+                    selection.source != "semantic_vector"
+                    and selection.confidence < MIN_SELECTOR_CONFIDENCE
+                ):
                     return None, (), SkillSelection(
                         confidence=selection.confidence,
                         reason="selected Skill confidence is below the routing threshold",

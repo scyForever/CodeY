@@ -11,6 +11,7 @@ def test_public_package_and_cli():
     result = subprocess.run([sys.executable, "-m", "CodeY", "--help"], capture_output=True, text=True, check=False)
     assert result.returncode == 0
     assert "--skill" in result.stdout
+    assert "--skill-embedding-provider" in result.stdout
     assert "--evolution-mode" in result.stdout
 
 

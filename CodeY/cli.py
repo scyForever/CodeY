@@ -16,12 +16,19 @@ import textwrap
 from .config import load_project_env, provider_env
 from .context.transcript import DEFAULT_RECENT_TURNS, DEFAULT_SUMMARY_MAX_CHARS
 from .providers.clients import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
+from .providers.embeddings import OllamaEmbeddingClient, OpenAICompatibleEmbeddingClient
 from .core.runtime import CodeYAgent
+from .skills.semantic import (
+    DEFAULT_EMBEDDING_BATCH_SIZE,
+    DEFAULT_SEMANTIC_MIN_MARGIN,
+    DEFAULT_SEMANTIC_MIN_SIMILARITY,
+)
 from .storage.session import SessionStore
 from .context.workspace import WorkspaceContext, middle
 
 DEFAULT_SECRET_ENV_NAMES = (
     "CODEY_OPENAI_API_KEY",
+    "CODEY_SKILL_EMBEDDING_API_KEY",
     "OPENAI_API_KEY",
     "OPENAI_API_TOKEN",
     "CODEY_ANTHROPIC_API_KEY",
@@ -71,6 +78,10 @@ DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
 DEFAULT_PROVIDER = "deepseek"
 PROVIDER_CHOICES = ("ollama", "openai", "anthropic", "deepseek")
+DEFAULT_OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
+DEFAULT_OPENAI_EMBEDDING_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_OLLAMA_EMBEDDING_MODEL = "embeddinggemma"
+SKILL_EMBEDDING_PROVIDER_CHOICES = ("off", "openai", "ollama")
 SECRET_ENV_NAMES_VAR = "CODEY_SECRET_ENV_NAMES"
 
 
@@ -182,6 +193,54 @@ def _build_model_client(args, model_override=None):
     )
 
 
+def _build_skill_embedding_client(args):
+    provider = (
+        getattr(args, "skill_embedding_provider", None)
+        or provider_env("CODEY_SKILL_EMBEDDING_PROVIDER", default="off")
+    )
+    if provider not in SKILL_EMBEDDING_PROVIDER_CHOICES:
+        choices = ", ".join(SKILL_EMBEDDING_PROVIDER_CHOICES)
+        raise ValueError(
+            f"unknown Skill embedding provider: {provider}. expected one of: {choices}"
+        )
+    if provider == "off":
+        return None
+
+    explicit_model = getattr(args, "skill_embedding_model", None)
+    timeout = getattr(args, "skill_embedding_timeout", 30.0)
+    if provider == "openai":
+        model = explicit_model or provider_env(
+            "CODEY_SKILL_EMBEDDING_MODEL",
+            default=DEFAULT_OPENAI_EMBEDDING_MODEL,
+        )
+        base_url = getattr(args, "skill_embedding_base_url", None) or provider_env(
+            "CODEY_SKILL_EMBEDDING_API_BASE",
+            default=DEFAULT_OPENAI_EMBEDDING_BASE_URL,
+        )
+        # Keep embedding credentials endpoint-scoped. Main-model gateway keys are
+        # intentionally not inherited by a different embeddings base URL.
+        api_key = provider_env("CODEY_SKILL_EMBEDDING_API_KEY")
+        return OpenAICompatibleEmbeddingClient(
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+            dimensions=getattr(args, "skill_embedding_dimensions", None),
+        )
+
+    if getattr(args, "skill_embedding_dimensions", None) is not None:
+        raise ValueError("--skill-embedding-dimensions is only supported by openai")
+    model = explicit_model or provider_env(
+        "CODEY_SKILL_EMBEDDING_MODEL",
+        default=DEFAULT_OLLAMA_EMBEDDING_MODEL,
+    )
+    host = getattr(args, "skill_embedding_host", None) or provider_env(
+        "CODEY_SKILL_EMBEDDING_HOST",
+        default=getattr(args, "host", DEFAULT_OLLAMA_HOST),
+    )
+    return OllamaEmbeddingClient(model=model, host=host, timeout=timeout)
+
+
 def build_welcome(agent, model, host):
     width = max(68, min(shutil.get_terminal_size((80, 20)).columns, 84))
     inner = width - 4
@@ -253,6 +312,7 @@ def build_agent(args):
         return _build_model_client(args)
 
     model = model_client_factory()
+    skill_embedding_client = _build_skill_embedding_client(args)
     summary_model_name = getattr(args, "summary_model", None)
     selector_model_name = getattr(args, "skill_selector_model", None)
     summary_model = (
@@ -285,6 +345,16 @@ def build_agent(args):
             max_new_tokens=args.max_new_tokens,
             skill_model_client=skill_selector_model,
             skill_selection_max_new_tokens=getattr(args, "skill_selector_max_new_tokens", 256),
+            skill_embedding_client=skill_embedding_client,
+            skill_semantic_min_similarity=getattr(
+                args, "skill_semantic_threshold", DEFAULT_SEMANTIC_MIN_SIMILARITY
+            ),
+            skill_semantic_min_margin=getattr(
+                args, "skill_semantic_margin", DEFAULT_SEMANTIC_MIN_MARGIN
+            ),
+            skill_embedding_batch_size=getattr(
+                args, "skill_embedding_batch_size", DEFAULT_EMBEDDING_BATCH_SIZE
+            ),
             summary_model_client=summary_model,
             summary_recent_turns=getattr(args, "summary_recent_turns", DEFAULT_RECENT_TURNS),
             summary_max_new_tokens=getattr(args, "summary_max_new_tokens", 512),
@@ -305,6 +375,16 @@ def build_agent(args):
         max_new_tokens=args.max_new_tokens,
         skill_model_client=skill_selector_model,
         skill_selection_max_new_tokens=getattr(args, "skill_selector_max_new_tokens", 256),
+        skill_embedding_client=skill_embedding_client,
+        skill_semantic_min_similarity=getattr(
+            args, "skill_semantic_threshold", DEFAULT_SEMANTIC_MIN_SIMILARITY
+        ),
+        skill_semantic_min_margin=getattr(
+            args, "skill_semantic_margin", DEFAULT_SEMANTIC_MIN_MARGIN
+        ),
+        skill_embedding_batch_size=getattr(
+            args, "skill_embedding_batch_size", DEFAULT_EMBEDDING_BATCH_SIZE
+        ),
         summary_model_client=summary_model,
         summary_recent_turns=getattr(args, "summary_recent_turns", DEFAULT_RECENT_TURNS),
         summary_max_new_tokens=getattr(args, "summary_max_new_tokens", 512),
@@ -351,6 +431,57 @@ def build_arg_parser():
         type=int,
         default=256,
         help="Maximum output tokens for one Description-based Skill selection call.",
+    )
+    parser.add_argument(
+        "--skill-embedding-provider",
+        choices=SKILL_EMBEDDING_PROVIDER_CHOICES,
+        default=None,
+        help="Dense embedding backend for semantic Skill routing; defaults to CODEY_SKILL_EMBEDDING_PROVIDER or off.",
+    )
+    parser.add_argument(
+        "--skill-embedding-model",
+        default=None,
+        help="Embedding model override for semantic Skill routing.",
+    )
+    parser.add_argument(
+        "--skill-embedding-base-url",
+        default=None,
+        help="OpenAI-compatible embeddings API base URL.",
+    )
+    parser.add_argument(
+        "--skill-embedding-host",
+        default=None,
+        help="Ollama host used for semantic Skill embeddings.",
+    )
+    parser.add_argument(
+        "--skill-embedding-timeout",
+        type=float,
+        default=30.0,
+        help="Embedding request timeout in seconds.",
+    )
+    parser.add_argument(
+        "--skill-embedding-dimensions",
+        type=int,
+        default=None,
+        help="Optional OpenAI-compatible embedding output dimensions.",
+    )
+    parser.add_argument(
+        "--skill-semantic-threshold",
+        type=float,
+        default=DEFAULT_SEMANTIC_MIN_SIMILARITY,
+        help="Minimum cosine similarity required to accept a semantic Skill route.",
+    )
+    parser.add_argument(
+        "--skill-semantic-margin",
+        type=float,
+        default=DEFAULT_SEMANTIC_MIN_MARGIN,
+        help="Minimum top-two cosine margin required to accept a semantic Skill route.",
+    )
+    parser.add_argument(
+        "--skill-embedding-batch-size",
+        type=int,
+        default=DEFAULT_EMBEDDING_BATCH_SIZE,
+        help="Maximum number of Skill documents embedded per index request.",
     )
     parser.add_argument(
         "--summary-model",

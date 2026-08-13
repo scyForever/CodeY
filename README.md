@@ -8,7 +8,7 @@ CodeY 是一个面向本地代码仓库的小型 Coding Agent Runtime。它将�
 
 - **LangGraph Agent 循环**：`Think → Reflect → Act` 通过条件边动态路由，模型每轮只能返回一个受控 `<tool>` 或 `<final>`。
 - **主 AgentLoop + 同质 Fork**：复杂任务可用 `fork_join` 并行运行多个同模板、独立 thread 的只读子 Agent，再由主 Agent 统一汇总。
-- **结构化 Skill 管理**：先进行领域 Skill 粗路由，再按 `SKILL.md` 的 Tasks 表选择任务路由。
+- **结构化 Skill 管理**：显式/词法高精度规则之后，可用向量语义索引选择领域 Skill，低置信度或歧义结果回退 Description LLM，再按 `SKILL.md` 的 Tasks 表选择任务路由。
 - **渐进式按需加载**：SessionStart 只加载 Skill 导航和 Always-read 核心约束；只有命中的任务才读取 workflow 和 route-specific 文件。
 - **XML 核心边界**：`<always-applicable>` 与 `<task-routing>` 将核心约束和路由协议分开，便于压缩后重新注入。
 - **Python Runtime Hooks**：支持 `startup`、`resume`、`reset`、`compact` 四种 SessionStart 原因。
@@ -115,12 +115,16 @@ Always Read:
 
 ### 双层路由
 
-1. **Skill 路由**：显式 `/skill-name` 优先；自动路由从 `description` 中解析两条互斥的 activation phrase 和三条 near-miss，唯一词法命中可直接选择，否则把完整候选证据交给独立 selector 模型。低置信度、near-miss 命中或非法 selector 输出都会拒绝激活或降级为空路由。
+1. **Skill 路由**：显式 `/skill-name` 优先；自动路由从 `description` 中解析两条互斥的 activation phrase 和三条 near-miss，唯一词法命中可直接选择。其余请求在配置 Embedding 后进入向量语义索引；未配置、相似度不足、Top-2 差距不足或 Embedding 调用失败时，把完整候选证据交给独立 Description selector 模型。near-miss 是向量和模型都不能绕过的硬否决边界。
 2. **Task 路由**：只在已选 Skill 内按任务 label/trigger 匹配；无匹配时使用唯一的 `other`。
 
 一个 `ask()` 运行期间会固定路由，避免模型重试或工具循环中途切换工作流；同一 session 的下一条用户请求会重新路由。
 
 每次路由会持久化请求、全部候选证据、选择来源、执行结果和显式反馈。反馈可附带 `expected_skill_name`，从而区分正确激活、误激活与漏激活；达到样本阈值后只生成待人工审核的 Description Patch，不会直接改写线上 Skill。
+
+向量索引只使用 Skill 名称、Description 的正向职责、activation phrase 和任务 label/trigger；near-miss 文本不作为正样本嵌入，而是在候选层单独否决。索引按 Embedding client 身份和 Skill 文本生成 SHA-256 fingerprint，首次查询分批构建，后续在进程内复用；当前实现对工作区规模采用精确余弦排序，不引入额外向量数据库。只有 Top-1 cosine 达到 `--skill-semantic-threshold`（默认 `0.55`），且存在多个候选时 Top-2 margin 达到 `--skill-semantic-margin`（默认 `0.05`），才直接接受 `semantic_vector` 路由。
+
+Embedding 向量只保存在进程内，不写入 session 或 run 工件；诊断工件保存模型名、维数、index fingerprint、分数、margin、接受状态和错误类型。发送 Embedding 前会先执行现有 secret redaction，但 Skill 的正向描述和脱敏后的用户请求仍会发往所配置的外部服务，因此需要自行评估数据边界、费用和服务端保留策略。
 
 ### 渐进式加载
 
@@ -188,6 +192,8 @@ Copy-Item .env.example .env
 | OpenAI-compatible | `CODEY_OPENAI_API_BASE`、`CODEY_OPENAI_API_KEY`、`CODEY_OPENAI_MODEL` |
 | Anthropic-compatible | `CODEY_ANTHROPIC_API_BASE`、`CODEY_ANTHROPIC_API_KEY`、`CODEY_ANTHROPIC_MODEL` |
 | Ollama | `--host`、`--model` |
+| Skill Embedding（OpenAI-compatible） | `CODEY_SKILL_EMBEDDING_PROVIDER=openai`、`CODEY_SKILL_EMBEDDING_API_BASE`、`CODEY_SKILL_EMBEDDING_API_KEY`、`CODEY_SKILL_EMBEDDING_MODEL` |
+| Skill Embedding（Ollama） | `CODEY_SKILL_EMBEDDING_PROVIDER=ollama`、`CODEY_SKILL_EMBEDDING_HOST`、`CODEY_SKILL_EMBEDDING_MODEL` |
 
 选择优先级是：显式 CLI 参数 → 项目 `.env`/shell 环境 → 代码默认值。不要提交真实 `.env`。CodeY 会在 trace/report 中清理配置为 secret 的环境变量，但这不是凭据管理系统的替代品。
 
@@ -228,7 +234,21 @@ codey --skill off
 
 # 加载工作区内指定 Skill 文件或目录
 codey --skill skills/codey/SKILL.md
+
+# 使用 OpenAI-compatible Embedding；默认模型为 text-embedding-3-small
+codey --skill auto --skill-embedding-provider openai
+
+# 使用本地 Ollama Embedding；默认模型为 embeddinggemma
+codey --skill auto --skill-embedding-provider ollama
+
+# 调整语义接受阈值、Top-2 margin 和索引批大小
+codey --skill-embedding-provider ollama \
+  --skill-semantic-threshold 0.62 \
+  --skill-semantic-margin 0.08 \
+  --skill-embedding-batch-size 64
 ```
+
+Embedding 默认是 `off`，避免在没有明确配置时产生外部请求或费用；关闭时，非确定性命中的请求直接使用已有 Description selector。OpenAI-compatible 适配器调用 `/v1/embeddings`，Ollama 适配器调用 `/api/embed`，两者都支持批量构建 Skill 索引。Embedding endpoint 只读取专用的 `CODEY_SKILL_EMBEDDING_API_KEY`，不会把主模型或网关凭据自动转发到另一个 host。
 
 ### 恢复会话
 
@@ -283,7 +303,7 @@ codey --approval never # 拒绝危险操作
 7. 摘要尚未覆盖的旧 transcript、最近 N 个完整 turn 与未完成 turn 原文
 8. 当前用户请求
 
-每个完整 turn 结束后，可独立配置的 summary client 异步刷新结构化摘要；提交时校验 coverage、source hash 和 generation，再通过 session revision CAS 持久化，失败时回滚当前进程内存状态。摘要失败、仍在运行或因进程重启中断时，未覆盖 transcript 继续以 fallback 原文进入上下文；CLI 退出会在有界超时内等待摘要落盘。超预算时按完整 turn 分组裁剪旧 transcript，再压缩相关记忆、working memory、route context 与 prefix；当前请求永不裁剪。每轮 metadata 记录 section 大小、压缩步骤、摘要覆盖状态、prefix/workspace/tool/skill fingerprint 和路由加载证据。
+每个完整 turn 结束后，可独立配置的 summary client 在 daemon worker 中异步刷新结构化摘要；同一 session epoch 同时只运行一个 worker，重复刷新请求会合并，若 worker 运行期间 transcript 又增长，则在完成后自动补跑最新 coverage。提交时校验 coverage、source hash 和 generation，再通过 session revision CAS 持久化，失败时回滚当前进程内存状态。线程启动失败会清理 pending 并记录错误；进程重启发现中断的 pending 时会自动重排一次摘要。摘要失败或仍在运行时，未覆盖 transcript 继续以 fallback 原文进入上下文；CLI 退出会在有界超时内等待摘要落盘。超预算时按完整 turn 分组裁剪旧 transcript，再压缩相关记忆、working memory、route context 与 prefix；当前请求永不裁剪。每轮 metadata 记录 section 大小、压缩步骤、摘要覆盖状态、prefix/workspace/tool/skill fingerprint、语义路由诊断和按需加载证据。
 
 `prompt_cache_key` 是 CodeY 的稳定 prefix 身份。只有 provider adapter 明确声明支持时才会下发；当前 Anthropic-compatible 适配器并不等于官方 Anthropic SDK，也不会因此自动获得所有原生 prompt caching 能力。
 
