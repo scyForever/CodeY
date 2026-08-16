@@ -74,7 +74,13 @@ class ToolExecutor:
             message = f"error: invalid arguments for {name}: {exc}"
             if example:
                 message += f"\nexample: {example}"
-            security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
+            error_text = str(exc)
+            if "path escapes workspace" in error_text:
+                security_event_type = "path_escape"
+            elif "write path is not allowed by branch scope" in error_text:
+                security_event_type = "write_scope_violation"
+            else:
+                security_event_type = ""
             return ToolExecutionResult(
                 content=message,
                 metadata=_metadata(
@@ -144,7 +150,13 @@ class ToolExecutor:
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
-            security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
+            error_text = str(exc)
+            if "path escapes workspace" in error_text:
+                security_event_type = "path_escape"
+            elif "write path is not allowed by branch scope" in error_text:
+                security_event_type = "write_scope_violation"
+            else:
+                security_event_type = ""
             metadata = _metadata(
                 "partial_success" if workspace_changed else "error",
                 tool_error_code="tool_partial_success" if workspace_changed else "tool_failed",

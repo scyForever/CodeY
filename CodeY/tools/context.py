@@ -13,7 +13,9 @@ class ToolContext:
     depth: int
     max_depth: int
     spawn_fork: Callable[[dict], str]
+    spawn_fork_merge: Callable[[dict], str]
     max_fork_branches: int
+    fork_merge_enabled: bool
 
     def path(self, raw_path):
         return self.path_resolver(str(raw_path))

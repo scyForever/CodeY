@@ -7,13 +7,13 @@ CodeY 是一个面向本地代码仓库的小型 Coding Agent Runtime。它将�
 ## 核心能力
 
 - **LangGraph Agent 循环**：`Think → Reflect → Act` 通过条件边动态路由，模型每轮只能返回一个受控 `<tool>` 或 `<final>`。
-- **主 AgentLoop + 同质 Fork**：复杂任务可用 `fork_join` 并行运行多个同模板、独立 thread 的只读子 Agent，再由主 Agent 统一汇总。
+- **主 AgentLoop + 同质 Fork**：`fork_join` 并行运行只读子 Agent 并汇总证据；显式启用的 `fork_merge` 可让同模板子 Agent 在独立 Git worktree 中并行修改互斥文件租约，组合验证通过后原子快进目标分支。
 - **结构化 Skill 管理**：显式/词法高精度规则之后，可用向量语义索引选择领域 Skill，低置信度或歧义结果回退 Description LLM，再按 `SKILL.md` 的 Tasks 表选择任务路由。
 - **渐进式按需加载**：SessionStart 只加载 Skill 导航和 Always-read 核心约束；只有命中的任务才读取 workflow 和 route-specific 文件。
 - **XML 核心边界**：`<always-applicable>` 与 `<task-routing>` 将核心约束和路由协议分开，便于压缩后重新注入。
 - **Python Runtime Hooks**：支持 `startup`、`resume`、`reset`、`compact` 四种 SessionStart 原因。
 - **分段上下文预算**：稳定 prefix、恢复 checkpoint、route context、memory、相关记忆、异步摘要、transcript 和当前请求分别管理；当前请求不会被裁剪。
-- **工具安全边界**：工作区路径约束、参数校验、重复调用防护、危险操作审批、只读子 Agent 和 secret redaction。
+- **工具安全边界**：工作区路径约束、参数校验、重复调用防护、危险操作审批、只读 Fork、隔离可写 Fork 的精确路径租约，以及 secret redaction。
 - **可恢复与可审计**：会话、检查点、工作记忆、trace、task state 和 report 持久化到 `.codey/`。
 - **规则监督的认知闭环**：任务结束后基于结构化 trace 完成自省、结果归一化、根因归类、Patch 灰度和知识路由；可选的受限 LLM Advisor 只能消歧和精炼规则候选，不会从模型自由文本中猜测性学习。
 - **评测工具**：包含固定任务评测、上下文/记忆/恢复/安全实验与 provider 实验脚本。
@@ -34,7 +34,8 @@ CLI
        ├─ LangGraph AgentLoop（Think → Reflect → Act）
        │    ├─ ModelClient
        │    ├─ ToolExecutor
-       │    ├─ ForkCoordinator ── 同质 child graphs + structured join
+       │    ├─ ForkCoordinator ── 只读 child graphs + structured join
+       │    ├─ WorktreeForkCoordinator ── scoped edits + validate + ff-only
        │    └─ CognitiveLoop（trace、outcome、root cause、patch gate）
        └─ Session / Checkpoint / Run / Memory stores
 ```
@@ -267,6 +268,18 @@ codey --approval auto  # 自动批准
 codey --approval never # 拒绝危险操作
 ```
 
+### 启用隔离可写 Fork
+
+`fork_merge` 默认不进入工具表。至少配置一条用户授权的验证命令后才启用；命令会解析为固定 argv，以 `shell=False` 在临时 integration worktree 中运行：
+
+```bash
+codey --approval ask \
+  --fork-merge-check "python -m pytest -q" \
+  --fork-merge-check "python -m ruff check CodeY tests"
+```
+
+`fork_merge` 要求 clean 的本地 Git branch，并要求每个分支声明互不重叠的精确 `allowed_paths`。子 Agent 只能使用文件读写工具，不能运行 shell 或 Git；候选组合、验证或目标基线复核任一步失败时，目标分支保持不变。它只做本地 `ff-only`，不会 push、开 PR、stash、reset 或自动解决同文件冲突。该协议保证逻辑上的 all-success，不承诺最终 Git 快进与状态落盘之间的跨进程崩溃原子性；协调器会预先记录 merge intent，但当前崩溃后的 reconciliation 需要人工按 commit 三元组核对。单条验证命令默认超时 120 秒，可用 `--fork-merge-check-timeout` 调整。
+
 ## 工具与安全模型
 
 内置工具包括：
@@ -278,6 +291,7 @@ codey --approval never # 拒绝危险操作
 - `write_file`
 - `patch_file`
 - `fork_join`
+- `fork_merge`（仅在配置验证门后暴露）
 
 关键边界：
 
@@ -286,6 +300,7 @@ codey --approval never # 拒绝危险操作
 - `patch_file` 要求旧文本唯一匹配。
 - 连续重复且无进展的工具调用会被拒绝。
 - `fork_join` 以不同 `thread_id` 并发运行同一 StateGraph 模板；分支拥有独立 session/run，固定只读并采用 `all_settled` Join。
+- `fork_merge` 是单独的高风险协议：独立 detached worktree、精确路径租约、无 shell child、候选 diff/commit、临时组合验证、目标 HEAD/ref/status 再核对和最终 `ff-only`。任一分支或验证失败都不会部分修改目标。
 - shell 只继承 allowlist 环境；trace/report 做 secret redaction。
 
 模型输出仍属于不可信输入。若把 CodeY 用于不可信仓库或高风险执行环境，应额外使用容器、受限系统用户和网络隔离。
@@ -318,7 +333,9 @@ codey --approval never # 拒绝危险操作
 │  ├─ task_state.json
 │  ├─ trace.jsonl
 │  ├─ report.json
-│  └─ branches/<fork-id>/<branch-id>.json
+│  └─ branches/<fork-id>/
+│     ├─ <branch-id>.json
+│     └─ <branch-id>.patch
 ├─ memory/
    ├─ MEMORY.md
    └─ topics/*.md
@@ -411,11 +428,22 @@ Patch 是 JSON 对象，至少包含 `type`、`scope`、`correction`、`trigger_
 - `CodeY/evaluation/metrics.py`：记忆/上下文/安全/恢复实验与报告渲染。
 - `CodeY/evaluation/real_skill_routing.py`：真实外部模型的多 Skill 选择、解析和计分。
 - `CodeY/evaluation/long_context_dialogue.py`：从本机 Codex rollout 构建去标识化长对话数据，并进行配对 replay。
+- `CodeY/evaluation/fork_merge_efficiency.py`：用固定延迟 fake provider 对比同一 writable Fork harness 的串行槽位与并行槽位，检查工作守恒、结果 digest、真实重叠和端到端耗时。
 - `scripts/run_real_skill_routing_experiment.py`：运行 5/15/25/50/100 Skill 对照实验。
 - `scripts/run_long_context_dialogue_experiment.py`：运行完整对话、真实压缩摘要、尾窗、结构化 ledger 与 oracle 对照。
 - `scripts/run_provider_experiments.py`：provider 实验。
 - `scripts/collect_resume_metrics.py`：聚合 benchmark 与 run artifacts。
 - `scripts/run_large_scale_experiments.py`：生成完整实验产物。
+- `scripts/run_fork_merge_efficiency_experiment.py`：运行 `fork_merge` 串行/并行配对实验，结果写入本地 `artifacts/`。
+
+### Writable Fork 效率实验
+
+```bash
+python scripts/run_fork_merge_efficiency_experiment.py \
+  --repetitions 8 --warmups 2 --delay-ms 200 --parallelism 2
+```
+
+实验每个条件执行完全相同的两个 child Agent、四次带固定延迟的 child-provider calls（另有两次不计入 tracker、无固定延迟的 parent fake completions）、两个候选修改、Git 集成和验证，只改变 `max_parallel_branches=1/2`。逐 trial 交替条件顺序；`api.txt/tests.txt` fixture content digest、child 调用数、成功状态必须全部一致，每个串行 trial 必须满足 `max_active=1`、每个并行 trial 必须满足 `max_active=2`，且 5th-percentile 配对端到端 speedup 大于 `1.0`，实验命令才返回成功。比值始终作为诊断数据计算，但只有正确性、工作守恒、内容等价和重叠门全部通过时才采信“观察到效率收益”。固定 `sleep` 只模拟可并发的 provider 等待，因此结果只能证明当前 harness 能重叠独立分支并在该 synthetic workload 上减少耗时，不能表述成真实模型 QPS、生产 P95 或通用代码任务加速。
 
 ### 真实模型多 Skill 命中率
 
@@ -483,4 +511,4 @@ python -m compileall -q CodeY
 python -m CodeY --help
 ```
 
-测试使用临时 workspace 与 `FakeModelClient`，覆盖双层路由、渐进加载、非法路径、SessionStart 生命周期、XML 边界、上下文预算、同 session 重路由和包入口。
+测试使用临时 workspace 与 `FakeModelClient`，覆盖双层路由、渐进加载、非法路径、SessionStart 生命周期、XML 边界、上下文预算、同 session 重路由、只读 Fork、真实 Git worktree 隔离写、路径租约、pre-stage secret gate、验证命令不得改变 integration `HEAD`、Git status 失败关闭、cleanup pending 和包入口。机器相关 speedup 不作为 pytest 硬门；pytest 验证运行时不变量以及实验门禁的纯逻辑，正式计时统计由显式实验脚本生成。

@@ -307,6 +307,12 @@ def build_agent(args):
     workspace = WorkspaceContext.build(args.cwd)
     load_project_env(workspace.repo_root)
     configured_secret_names = _configured_secret_names(args)
+    fork_merge_checks = []
+    for index, raw_command in enumerate(getattr(args, "fork_merge_checks", [])):
+        command = tuple(shlex.split(str(raw_command)))
+        if not command:
+            raise ValueError(f"--fork-merge-check #{index + 1} is empty")
+        fork_merge_checks.append(command)
     store = SessionStore(workspace.repo_root + "/.codey/sessions")
     def model_client_factory(_spec=None):
         return _build_model_client(args)
@@ -364,6 +370,8 @@ def build_agent(args):
             evolution_llm_config=evolution_llm_config,
             max_fork_branches=args.max_fork_branches,
             max_parallel_branches=args.max_parallel_branches,
+            fork_merge_checks=fork_merge_checks,
+            fork_merge_check_timeout=args.fork_merge_check_timeout,
         )
     return CodeYAgent(
         model_client=model,
@@ -394,6 +402,8 @@ def build_agent(args):
         evolution_llm_config=evolution_llm_config,
         max_fork_branches=args.max_fork_branches,
         max_parallel_branches=args.max_parallel_branches,
+        fork_merge_checks=fork_merge_checks,
+        fork_merge_check_timeout=args.fork_merge_check_timeout,
     )
 
 
@@ -532,6 +542,23 @@ def build_arg_parser():
         type=int,
         default=4,
         help="Maximum fork_join child agents executing concurrently.",
+    )
+    parser.add_argument(
+        "--fork-merge-check",
+        dest="fork_merge_checks",
+        action="append",
+        default=[],
+        metavar="COMMAND",
+        help=(
+            "Fixed-argv validation command for isolated writable fork_merge. "
+            "Repeat to add gates; fork_merge is disabled when none are configured."
+        ),
+    )
+    parser.add_argument(
+        "--fork-merge-check-timeout",
+        type=int,
+        default=120,
+        help="Timeout in seconds for each configured fork_merge validation command.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
     parser.add_argument(

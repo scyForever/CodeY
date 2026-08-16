@@ -35,6 +35,9 @@ class RunStore:
     def branch_result_path(self, run_id, fork_id, branch_id):
         return self.run_dir(run_id) / "branches" / str(fork_id) / f"{branch_id}.json"
 
+    def branch_patch_path(self, run_id, fork_id, branch_id):
+        return self.run_dir(run_id) / "branches" / str(fork_id) / f"{branch_id}.patch"
+
     def start_run(self, task_state):
         # 每次 ask() 都会生成一个 run 目录。
         # 这样一次用户请求对应一组独立工件，后续排查更容易。
@@ -81,6 +84,12 @@ class RunStore:
         path = self.branch_result_path(run_id, fork_id, branch_id)
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def write_branch_patch(self, run_id, fork_id, branch_id, patch_text):
+        path = self.branch_patch_path(run_id, fork_id, branch_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_text_atomic(path, str(patch_text))
+        return path
+
     def _write_json_atomic(self, path, payload):
         # 原子写：先写临时文件，再 replace。
         # 这样即使中途异常，也不容易留下半截 JSON。
@@ -94,5 +103,20 @@ class RunStore:
         ) as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
             handle.write("\n")
+            temp_name = handle.name
+        Path(temp_name).replace(path)
+
+    def _write_text_atomic(self, path, text):
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            delete=False,
+            dir=str(path.parent),
+            prefix=path.name + ".",
+            suffix=".tmp",
+        ) as handle:
+            handle.write(str(text))
+            if text and not str(text).endswith("\n"):
+                handle.write("\n")
             temp_name = handle.name
         Path(temp_name).replace(path)

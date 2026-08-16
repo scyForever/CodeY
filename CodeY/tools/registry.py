@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import textwrap
 from functools import partial
+from pathlib import PurePosixPath
 
 from ..context.workspace import IGNORED_PATH_NAMES
 
@@ -54,9 +55,63 @@ FORK_JOIN_TOOL_SPEC = {
     "description": "Run bounded read-only objectives in parallel with homogeneous child agents and return structured results.",
 }
 
+FORK_MERGE_TOOL_SPEC = {
+    "schema": {
+        "tasks": "list[{id:str,objective:str,allowed_paths:list[str]}]",
+        "max_steps": "int=4",
+        "merge_policy": "str='atomic_disjoint'",
+    },
+    "risky": True,
+    "description": (
+        "Run scoped writable objectives in parallel isolated Git worktrees, "
+        "validate their combined commit with coordinator-configured checks, and "
+        "atomically fast-forward a clean target branch. Exact path leases must be disjoint."
+    ),
+}
+
+PROTECTED_SCOPED_PATH_PARTS = {".git", ".codey", ".codex", ".claude", ".cursor"}
+PROTECTED_SCOPED_ROOT_FILES = {".gitignore", ".gitattributes", ".gitmodules", "pyproject.toml"}
+WINDOWS_RESERVED_PATH_NAMES = {
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+}
+
+
+def normalize_scoped_path(raw_path):
+    """Normalize one exact writable path lease and reject protected/ambiguous forms."""
+
+    raw = str(raw_path or "").strip().replace("\\", "/")
+    if len(raw) > 500:
+        raise ValueError("allowed_paths entries must not exceed 500 characters")
+    if not raw or raw.endswith("/") or raw.startswith("/"):
+        raise ValueError("allowed_paths entries must be exact repo-relative files")
+    path = PurePosixPath(raw)
+    parts = path.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("allowed_paths entries must be normalized repo-relative files")
+    if ":" in parts[0]:
+        raise ValueError("allowed_paths entries must not use drive-qualified paths")
+    if any(part.endswith((" ", ".")) for part in parts):
+        raise ValueError("allowed_paths entries must not end with spaces or dots")
+    if any(part.casefold() in PROTECTED_SCOPED_PATH_PARTS for part in parts):
+        raise ValueError("allowed_paths entries must not target protected metadata")
+    if parts[0].casefold() == ".env" or parts[0].casefold().startswith(".env."):
+        raise ValueError("allowed_paths entries must not target environment files")
+    if len(parts) == 1 and parts[0].casefold() in PROTECTED_SCOPED_ROOT_FILES:
+        raise ValueError("allowed_paths entry requires manual review and cannot be auto-merged")
+    for part in parts:
+        stem = part.split(".", 1)[0].casefold()
+        if stem in WINDOWS_RESERVED_PATH_NAMES:
+            raise ValueError("allowed_paths entry uses a Windows reserved name")
+    return path.as_posix()
+
 
 def legal_tool_names():
-    return set(BASE_TOOL_SPECS) | {"fork_join"}
+    return set(BASE_TOOL_SPECS) | {"fork_join", "fork_merge"}
 
 TOOL_EXAMPLES = {
     "list_files": '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
@@ -66,6 +121,7 @@ TOOL_EXAMPLES = {
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
     "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
     "fork_join": '<tool>{"name":"fork_join","args":{"tasks":[{"id":"api","objective":"inspect the API"},{"id":"tests","objective":"inspect tests"}],"max_steps":3}}</tool>',
+    "fork_merge": '<tool>{"name":"fork_merge","args":{"tasks":[{"id":"api","objective":"update the API","allowed_paths":["src/api.py"]},{"id":"tests","objective":"add tests","allowed_paths":["tests/test_api.py"]}],"max_steps":4}}</tool>',
 }
 
 
@@ -80,6 +136,11 @@ def build_tool_registry(context):
     # fork_join 不再暴露给模型，避免无界递归。
     if context.depth < context.max_depth:
         tools["fork_join"] = {**FORK_JOIN_TOOL_SPEC, "run": partial(tool_fork_join, context)}
+        if context.fork_merge_enabled:
+            tools["fork_merge"] = {
+                **FORK_MERGE_TOOL_SPEC,
+                "run": partial(tool_fork_merge, context),
+            }
     return tools
 
 
@@ -110,6 +171,8 @@ def validate_tool(context, name, args):
         pattern = str(args.get("pattern", "")).strip()
         if not pattern:
             raise ValueError("pattern must not be empty")
+        if len(pattern) > 2000 or "\0" in pattern:
+            raise ValueError("pattern must not exceed 2000 characters or contain NUL")
         context.path(args.get("path", "."))
         return
 
@@ -177,6 +240,64 @@ def validate_tool(context, name, args):
             raise ValueError("join_policy must be 'all_settled'")
         return
 
+    if name == "fork_merge":
+        if context.depth >= context.max_depth:
+            raise ValueError("fork depth exceeded")
+        if not context.fork_merge_enabled:
+            raise ValueError("fork_merge requires coordinator-configured validation checks")
+        tasks = args.get("tasks")
+        if not isinstance(tasks, list):
+            raise ValueError("tasks must be a list")
+        if len(tasks) < 2:
+            raise ValueError("fork_merge requires at least two tasks")
+        if len(tasks) > context.max_fork_branches:
+            raise ValueError(f"fork_merge accepts at most {context.max_fork_branches} tasks")
+        seen_ids = set()
+        leased_paths = {}
+        total_paths = 0
+        for index, item in enumerate(tasks):
+            if not isinstance(item, dict):
+                raise ValueError(f"tasks[{index}] must be an object")
+            objective = str(item.get("objective", "")).strip()
+            if not objective:
+                raise ValueError(f"tasks[{index}].objective must not be empty")
+            if len(objective) > 8000:
+                raise ValueError(f"tasks[{index}].objective must not exceed 8000 characters")
+            branch_id = str(item.get("id", f"branch-{index + 1}")).strip()
+            if not branch_id:
+                raise ValueError(f"tasks[{index}].id must not be empty")
+            if len(branch_id) > 128:
+                raise ValueError(f"tasks[{index}].id must not exceed 128 characters")
+            branch_key = branch_id.casefold()
+            if branch_key in seen_ids:
+                raise ValueError(f"duplicate branch id: {branch_id}")
+            if branch_id.split(".", 1)[0].casefold() in WINDOWS_RESERVED_PATH_NAMES:
+                raise ValueError(f"tasks[{index}].id uses a Windows reserved name")
+            seen_ids.add(branch_key)
+            allowed_paths = item.get("allowed_paths")
+            if not isinstance(allowed_paths, list) or not allowed_paths:
+                raise ValueError(f"tasks[{index}].allowed_paths must be a non-empty list")
+            normalized_paths = [normalize_scoped_path(path) for path in allowed_paths]
+            if len({path.casefold() for path in normalized_paths}) != len(normalized_paths):
+                raise ValueError(f"tasks[{index}].allowed_paths contains duplicate paths")
+            total_paths += len(normalized_paths)
+            for path in normalized_paths:
+                folded = path.casefold()
+                if folded in leased_paths:
+                    raise ValueError(
+                        f"allowed path lease conflict: {path} is assigned to both "
+                        f"{leased_paths[folded]} and {branch_id}"
+                    )
+                leased_paths[folded] = branch_id
+        if total_paths > 64:
+            raise ValueError("fork_merge accepts at most 64 total allowed paths")
+        max_steps = int(args.get("max_steps", 4))
+        if max_steps < 1 or max_steps > 12:
+            raise ValueError("max_steps must be in [1, 12]")
+        if str(args.get("merge_policy", "atomic_disjoint")) != "atomic_disjoint":
+            raise ValueError("merge_policy must be 'atomic_disjoint'")
+        return
+
 
 def tool_list_files(context, args):
     path = context.path(args.get("path", "."))
@@ -210,15 +331,21 @@ def tool_search(context, args):
     pattern = str(args.get("pattern", "")).strip()
     if not pattern:
         raise ValueError("pattern must not be empty")
+    if len(pattern) > 2000 or "\0" in pattern:
+        raise ValueError("pattern must not exceed 2000 characters or contain NUL")
     path = context.path(args.get("path", "."))
 
     if shutil.which("rg"):
         # 优先用 rg，因为搜索会非常频繁，搜索延迟会直接影响 agent 控制循环。
         result = subprocess.run(
-            ["rg", "-n", "--smart-case", "--max-count", "200", pattern, str(path)],
+            ["rg", "-n", "--smart-case", "--max-count", "200", "--", pattern, str(path)],
             cwd=context.root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            env=context.shell_env(),
         )
         return result.stdout.strip() or result.stderr.strip() or "(no matches)"
 
@@ -294,6 +421,14 @@ def tool_fork_join(context, args):
     if context.depth >= context.max_depth:
         raise ValueError("fork depth exceeded")
     return context.spawn_fork(args)
+
+
+def tool_fork_merge(context, args):
+    if context.depth >= context.max_depth:
+        raise ValueError("fork depth exceeded")
+    if not context.fork_merge_enabled:
+        raise ValueError("fork_merge requires coordinator-configured validation checks")
+    return context.spawn_fork_merge(args)
 
 
 _TOOL_RUNNERS = {

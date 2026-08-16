@@ -94,6 +94,7 @@ class CodeYAgent:
         secret_env_names=None,
         feature_flags=None,
         allowed_tools=None,
+        write_allowed_paths=None,
         skill_mode="auto",
         hook_callbacks=None,
         evolution_thresholds=None,
@@ -115,6 +116,8 @@ class CodeYAgent:
         graph_checkpointer=None,
         max_fork_branches=4,
         max_parallel_branches=4,
+        fork_merge_checks=None,
+        fork_merge_check_timeout=120,
         allow_persistent_graph_checkpointer=False,
         parent_run_id="",
         fork_id="",
@@ -128,6 +131,8 @@ class CodeYAgent:
         self.summary_max_new_tokens = max(64, int(summary_max_new_tokens))
         self.model_client_factory = model_client_factory
         self._model_client_lock = model_client_lock or threading.RLock()
+        self._branch_client_locks = {}
+        self._branch_client_locks_guard = threading.Lock()
         self._skill_model_client_lock = (
             self._model_client_lock
             if self.skill_model_client is self.model_client
@@ -151,6 +156,9 @@ class CodeYAgent:
         self.max_depth = max_depth
         self.max_fork_branches = max(2, int(max_fork_branches))
         self.max_parallel_branches = max(1, min(int(max_parallel_branches), self.max_fork_branches))
+        self.fork_merge_checks = self._normalize_fork_merge_checks(fork_merge_checks)
+        self.fork_merge_check_timeout = max(1, min(int(fork_merge_check_timeout), 1800))
+        self.fork_merge_enabled = bool(self.fork_merge_checks)
         self.parent_run_id = str(parent_run_id or "")
         self.fork_id = str(fork_id or "")
         self.branch_id = str(branch_id or "")
@@ -162,6 +170,7 @@ class CodeYAgent:
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
+        self.write_allowed_paths = self._normalize_write_allowed_paths(write_allowed_paths)
         self.skill_mode = str(skill_mode or "auto")
         self.skill_router = SkillRouter(self.root, mode=self.skill_mode)
         self.skill_embedding_client = skill_embedding_client
@@ -366,6 +375,38 @@ class CodeYAgent:
         if not normalized or any(not name for name in normalized):
             raise ValueError("allowed_tools must be a non-empty sequence of tool names")
         return normalized
+
+    @staticmethod
+    def _normalize_write_allowed_paths(write_allowed_paths):
+        if write_allowed_paths is None:
+            return None
+        normalized = tuple(
+            toolkit.normalize_scoped_path(path)
+            for path in write_allowed_paths
+        )
+        if not normalized:
+            raise ValueError("write_allowed_paths must be a non-empty sequence")
+        if len({path.casefold() for path in normalized}) != len(normalized):
+            raise ValueError("write_allowed_paths contains duplicate paths")
+        return normalized
+
+    @staticmethod
+    def _normalize_fork_merge_checks(commands):
+        if commands is None:
+            return ()
+        normalized = []
+        for index, command in enumerate(commands):
+            if isinstance(command, (str, bytes)) or not isinstance(command, (list, tuple)):
+                raise ValueError(f"fork_merge_checks[{index}] must be an argv sequence")
+            argv = tuple(str(item).strip() for item in command)
+            if not argv or any(not item for item in argv):
+                raise ValueError(f"fork_merge_checks[{index}] must not be empty")
+            if any(len(item) > 1000 for item in argv):
+                raise ValueError(f"fork_merge_checks[{index}] contains an oversized argument")
+            normalized.append(argv)
+        if len(normalized) > 8:
+            raise ValueError("fork_merge_checks accepts at most 8 commands")
+        return tuple(normalized)
 
     def _apply_tool_allowlist(self, tools):
         if self.allowed_tools is None:
@@ -1059,6 +1100,8 @@ class CodeYAgent:
     def validate_tool(self, name, args):
         """把通用工具校验和 runtime 级额外约束串起来。"""
         toolkit.validate_tool(self.tool_context(), name, args)
+        if name in {"write_file", "patch_file"}:
+            self.authorize_write_path(args["path"])
 
     def tool_context(self):
         return ToolContext(
@@ -1068,7 +1111,9 @@ class CodeYAgent:
             depth=self.depth,
             max_depth=self.max_depth,
             spawn_fork=self.spawn_fork,
+            spawn_fork_merge=self.spawn_fork_merge,
             max_fork_branches=self.max_fork_branches,
+            fork_merge_enabled=self.fork_merge_enabled,
         )
 
     def save_fork_state(self, fork_state):
@@ -1080,7 +1125,71 @@ class CodeYAgent:
     def _branch_model_client(self, spec):
         if self.model_client_factory is None:
             return self.model_client, self._model_client_lock
-        return self.model_client_factory(spec), None
+        client = self.model_client_factory(spec)
+        if client is self.model_client:
+            return client, self._model_client_lock
+        # A Python API factory can accidentally return the same mutable client
+        # for several branches.  Keying locks by object identity preserves real
+        # concurrency for distinct clients while serializing unsafe reuse.
+        with self._branch_client_locks_guard:
+            lock = self._branch_client_locks.setdefault(id(client), threading.RLock())
+        return client, lock
+
+    def _create_child(
+        self,
+        task,
+        max_steps,
+        *,
+        spec=None,
+        workspace=None,
+        approval_policy="never",
+        read_only=True,
+        allowed_tools=None,
+        write_allowed_paths=None,
+        parent_run_id="",
+        fork_id="",
+        branch_id="",
+        graph_thread_id="",
+    ):
+        model_client, model_client_lock = self._branch_model_client(spec)
+        child_workspace = workspace or self.workspace
+        child = CodeYAgent(
+            model_client=model_client,
+            model_client_factory=self.model_client_factory,
+            model_client_lock=model_client_lock,
+            graph_checkpointer=self.graph_checkpointer,
+            workspace=child_workspace,
+            session_store=self.session_store,
+            run_store=self.run_store,
+            approval_policy=approval_policy,
+            max_steps=int(max_steps),
+            max_new_tokens=self.max_new_tokens,
+            depth=self.depth + 1,
+            max_depth=self.max_depth,
+            read_only=read_only,
+            secret_env_names=self.secret_env_names,
+            shell_env_allowlist=self.shell_env_allowlist,
+            feature_flags={**self.feature_flags, "self_evolution": False},
+            allowed_tools=allowed_tools,
+            write_allowed_paths=write_allowed_paths,
+            skill_mode=self.skill_mode,
+            skill_embedding_client=self.skill_embedding_client,
+            skill_semantic_index=self.skill_semantic_index,
+            max_fork_branches=self.max_fork_branches,
+            max_parallel_branches=self.max_parallel_branches,
+            fork_merge_checks=(),
+            fork_merge_check_timeout=self.fork_merge_check_timeout,
+            allow_persistent_graph_checkpointer=self.allow_persistent_graph_checkpointer,
+            parent_run_id=parent_run_id,
+            fork_id=fork_id,
+            branch_id=branch_id,
+            graph_thread_id=graph_thread_id,
+        )
+        child.memory.set_task_summary(task)
+        child.memory.append_note(self.redact_artifact(clip(self.transcript_text(), 300)), source="fork-parent")
+        child.session["memory"] = child.memory.to_dict()
+        child.save_session()
+        return child
 
     def _create_read_only_child(
         self,
@@ -1093,41 +1202,18 @@ class CodeYAgent:
         branch_id="",
         graph_thread_id="",
     ):
-        model_client, model_client_lock = self._branch_model_client(spec)
-        child = CodeYAgent(
-            model_client=model_client,
-            model_client_factory=self.model_client_factory,
-            model_client_lock=model_client_lock,
-            graph_checkpointer=self.graph_checkpointer,
-            workspace=self.workspace,
-            session_store=self.session_store,
-            run_store=self.run_store,
+        return self._create_child(
+            task,
+            max_steps,
+            spec=spec,
             approval_policy="never",
-            max_steps=int(max_steps),
-            max_new_tokens=self.max_new_tokens,
-            depth=self.depth + 1,
-            max_depth=self.max_depth,
             read_only=True,
-            secret_env_names=self.secret_env_names,
-            shell_env_allowlist=self.shell_env_allowlist,
-            feature_flags={**self.feature_flags, "self_evolution": False},
             allowed_tools=self.allowed_tools,
-            skill_mode=self.skill_mode,
-            skill_embedding_client=self.skill_embedding_client,
-            skill_semantic_index=self.skill_semantic_index,
-            max_fork_branches=self.max_fork_branches,
-            max_parallel_branches=self.max_parallel_branches,
-            allow_persistent_graph_checkpointer=self.allow_persistent_graph_checkpointer,
             parent_run_id=parent_run_id,
             fork_id=fork_id,
             branch_id=branch_id,
             graph_thread_id=graph_thread_id,
         )
-        child.memory.set_task_summary(task)
-        child.memory.append_note(self.redact_artifact(clip(self.transcript_text(), 300)), source="fork-parent")
-        child.session["memory"] = child.memory.to_dict()
-        child.save_session()
-        return child
 
     def create_fork_child(self, spec, fork_id, thread_id, max_steps):
         parent_run_id = self.current_task_state.run_id if self.current_task_state else ""
@@ -1141,10 +1227,35 @@ class CodeYAgent:
             graph_thread_id=thread_id,
         )
 
+    def create_fork_merge_child(self, spec, fork_id, thread_id, max_steps, workspace):
+        from .worktree_fork import SCOPED_WRITE_TOOLS
+
+        parent_run_id = self.current_task_state.run_id if self.current_task_state else ""
+        return self._create_child(
+            spec.objective,
+            max_steps,
+            spec=spec,
+            workspace=workspace,
+            approval_policy="auto",
+            read_only=False,
+            allowed_tools=SCOPED_WRITE_TOOLS,
+            write_allowed_paths=spec.allowed_paths,
+            parent_run_id=parent_run_id,
+            fork_id=fork_id,
+            branch_id=spec.branch_id,
+            graph_thread_id=thread_id,
+        )
+
     def spawn_fork(self, args):
         from .fork import ForkCoordinator
 
         summary = ForkCoordinator(self).run(args)
+        return json.dumps(summary, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+    def spawn_fork_merge(self, args):
+        from .worktree_fork import WorktreeForkCoordinator
+
+        summary = WorktreeForkCoordinator(self).run(args)
         return json.dumps(summary, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
     def tool_list_files(self, args):
@@ -1307,12 +1418,32 @@ class CodeYAgent:
         self.current_route = RouteMatch()
         self.restore_session_context("reset")
 
+    def authorize_write_path(self, raw_path):
+        if self.write_allowed_paths is None:
+            return
+        resolved = self.path(raw_path)
+        relative = resolved.relative_to(self.root).as_posix()
+        normalized = toolkit.normalize_scoped_path(relative)
+        # Writable Fork leases are exact repo-relative paths.  The tool-schema
+        # validator remains conservative and rejects case-fold collisions, but
+        # authorization must never widen ``foo`` into ``Foo`` on a
+        # case-sensitive filesystem.
+        allowed = set(self.write_allowed_paths)
+        if normalized not in allowed:
+            raise ValueError(
+                f"write path is not allowed by branch scope: {normalized}"
+            )
+
     def path(self, raw_path):
         path = Path(raw_path)
         path = path if path.is_absolute() else self.root / path
         resolved = path.resolve()
         # 所有文件类工具都被锚定在 workspace root 之下。
         # 这样既能防住 "../" 逃逸，也能防住符号链接解析后跳出仓库。
-        if os.path.commonpath([str(self.root), str(resolved)]) != str(self.root):
+        try:
+            inside_root = os.path.commonpath([str(self.root), str(resolved)]) == str(self.root)
+        except ValueError:
+            inside_root = False
+        if not inside_root:
             raise ValueError(f"path escapes workspace: {raw_path}")
         return resolved

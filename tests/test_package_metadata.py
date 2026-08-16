@@ -23,6 +23,8 @@ def test_public_package_and_cli_help():
     assert "--evolution-mode" in result.stdout
     assert "--max-fork-branches" in result.stdout
     assert "--max-parallel-branches" in result.stdout
+    assert "--fork-merge-check" in result.stdout
+    assert "--fork-merge-check-timeout" in result.stdout
 
 
 def test_package_metadata_and_metrics_imports():

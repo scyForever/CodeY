@@ -22,6 +22,8 @@ RUNTIME_IDENTITY_KEYS = (
     "max_new_tokens",
     "feature_flags",
     "shell_env_allowlist",
+    "fork_merge_checks",
+    "fork_merge_check_timeout",
     "workspace_fingerprint",
     "tool_signature",
 )
@@ -39,6 +41,8 @@ def current_runtime_identity(agent):
         "max_new_tokens": int(agent.max_new_tokens),
         "feature_flags": dict(agent.feature_flags),
         "shell_env_allowlist": list(agent.shell_env_allowlist),
+        "fork_merge_checks": [list(command) for command in agent.fork_merge_checks],
+        "fork_merge_check_timeout": int(agent.fork_merge_check_timeout),
         "workspace_fingerprint": getattr(getattr(agent, "prefix_state", None), "workspace_fingerprint", agent.workspace.fingerprint()),
         "tool_signature": agent.tool_signature(),
     }

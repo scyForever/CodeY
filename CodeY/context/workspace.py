@@ -52,18 +52,21 @@ class WorkspaceContext:
         self.project_docs = project_docs
 
     @classmethod
-    def build(cls, cwd, repo_root_override=None):
+    def build(cls, cwd, repo_root_override=None, *, git_prefix_args=(), git_env=None):
         cwd = Path(cwd).resolve()
 
         def git(args, fallback=""):
             try:
                 result = subprocess.run(
-                    ["git", *args],
+                    ["git", *git_prefix_args, *args],
                     cwd=cwd,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     check=True,
                     timeout=5,
+                    env=git_env,
                 )
                 return result.stdout.strip() or fallback
             except Exception:

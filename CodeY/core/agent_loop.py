@@ -269,7 +269,7 @@ class AgentLoop:
         )
         if kind == "tool":
             name = str(payload.get("name", ""))
-            decision = "fork" if name == "fork_join" else "act"
+            decision = "fork" if name in {"fork_join", "fork_merge"} else "act"
         elif kind == "retry":
             agent.record_transcript({"role": "assistant", "content": payload, "created_at": now()})
             agent.run_store.write_task_state(task_state)
